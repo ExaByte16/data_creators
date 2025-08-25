@@ -24,7 +24,7 @@ import pandas as pd
 import streamlit as st
 
 
-APP_TITLE = "Oxnya Balance General"
+APP_TITLE = "Oxynia Balance General"
 
 
 # 1. Definición de los Mapeos según el PUC Colombia (idénticos al notebook)
