@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Oxnya Balance General – Streamlit App
+Oxynia Balance General – Streamlit App
 
 This app reproduces exactly the transformation steps from the provided notebook,
 adding a UI to upload the Excel export from SIIGO, input MES/ESTADO/AÑO/CENTRO DE COSTOS,
