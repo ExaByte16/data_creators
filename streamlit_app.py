@@ -159,7 +159,7 @@ def create_excel_download_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
 
 
 def process_dataframe(
-    df: pd.DataFrame, mes: str, estado: str, anio: str, centro_costos: str
+    df: pd.DataFrame, mes: str, estado: str, anio: str, centro_costos: str, desglosar_por_tercero: bool = False
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
     """
     Reproduce el pipeline del notebook y retorna:
@@ -172,8 +172,12 @@ def process_dataframe(
     """
     # Display df.head() in UI outside this function.
 
-    # Filter Transaccional == "No"
-    df_filtered = df[df["Transaccional"] == "No"].copy()
+    # Filter Transaccional: cuando desglosamos por tercero, incluimos "Sí" y "No"
+    # De lo contrario, solo "No" (comportamiento original)
+    if desglosar_por_tercero:
+        df_filtered = df.copy()  # Incluir todas las filas (Sí y No)
+    else:
+        df_filtered = df[df["Transaccional"] == "No"].copy()
 
     # Remove specified columns (exactly as notebook)
     columns_to_drop = [
@@ -185,20 +189,44 @@ def process_dataframe(
     ]
     df_filtered = df_filtered.drop(columns=columns_to_drop)
 
-    # Drop duplicates based on "Código cuenta contable"
-    df_unique_accounts = df_filtered.drop_duplicates(
-        subset=["Código cuenta contable"]
+    # Agregar por cuenta (y opcionalmente por tercero) para conservar o resumir el detalle de terceros
+    if desglosar_por_tercero:
+        group_keys = [
+            "Código cuenta contable",
+            "Nombre cuenta contable",
+            "Nombre tercero",
+        ]
+    else:
+        group_keys = [
+            "Código cuenta contable",
+            "Nombre cuenta contable",
+        ]
+
+    # Agrupar y sumar Saldo final, manteniendo las columnas clave
+    df_unique_accounts = (
+        df_filtered.groupby(group_keys, as_index=False, dropna=False)
+        .agg({"Saldo final": "sum"})
     )
 
+    # Si no se desglosa por tercero, garantizamos la columna para el flujo posterior
+    if "Nombre tercero" not in df_unique_accounts.columns:
+        df_unique_accounts["Nombre tercero"] = ""
+
+    # Filtrar filas con Código cuenta contable nulo o inválido antes de procesar
+    df_unique_accounts = df_unique_accounts[
+        df_unique_accounts["Código cuenta contable"].notna()
+    ].copy()
+    
     # Capture info() output
     info_buffer = StringIO()
     df_unique_accounts.info(buf=info_buffer)
     df_unique_accounts_info_text = info_buffer.getvalue()
 
-    # Convertir el código a string para manipulación
+    # Convertir el código a string para manipulación (manejar posibles decimales)
     df_unique_accounts = df_unique_accounts.copy()
     df_unique_accounts["Código str"] = (
-        df_unique_accounts["Código cuenta contable"].astype(int).astype(str)
+        df_unique_accounts["Código cuenta contable"]
+        .apply(lambda x: str(int(float(x))) if pd.notna(x) else "")
     )
 
     # Crear las columnas usando los mapeos y la función
@@ -330,6 +358,10 @@ def main() -> None:
     with col4:
         centro_costos = st.text_input("CENTRO DE COSTOS", value="")
 
+    desglosar_por_tercero = st.checkbox(
+        "Desglosar por TERCERO en los reportes finales", value=True
+    )
+
     process_clicked = st.button("Procesar y Generar Archivos")
 
     if process_clicked:
@@ -359,7 +391,7 @@ def main() -> None:
                 _df_filtered_head,
                 _df_unique_accounts_head,
                 _df_unique_accounts_info_text,
-            ) = process_dataframe(raw_df, mes, estado, anio, centro_costos)
+            ) = process_dataframe(raw_df, mes, estado, anio, centro_costos, desglosar_por_tercero)
 
             # Build Excel bytes
             bg_bytes = create_excel_download_bytes(

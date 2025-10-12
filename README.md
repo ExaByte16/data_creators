@@ -29,3 +29,4 @@ streamlit run streamlit_app.py
 
 ### Notes
 - If the column `Nombre tercero` is not present in the export, the app creates it blank so the `TERCERO` column exists in outputs, matching the notebook note that sometimes the name cannot be determined.
+
