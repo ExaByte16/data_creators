@@ -114,6 +114,95 @@ def determinar_grupo(row: pd.Series) -> str:
     return "NO CLASIFICADO"  # Para códigos que no encajen
 
 
+def _filter_leaf_accounts(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filtra el DataFrame para mantener solo las cuentas "hoja" (de mayor detalle).
+    
+    Una cuenta es "hoja" si su código NO es prefijo de otra cuenta en el dataset.
+    Esto evita incluir subtotales junto con sus componentes detallados.
+    
+    Por ejemplo, si tenemos cuentas 1635, 163505, 163510:
+    - 1635 NO es hoja (es prefijo de 163505 y 163510)
+    - 163505 y 163510 SÍ son hojas
+    
+    Args:
+        df: DataFrame con columna 'Código cuenta contable'
+        
+    Returns:
+        DataFrame filtrado con solo cuentas hoja
+    """
+    if df.empty:
+        return df
+    
+    # Obtener todos los códigos únicos como strings limpios
+    df = df.copy()
+    codigos = (
+        df["Código cuenta contable"]
+        .astype(str)
+        .str.replace(".0", "", regex=False)
+        .unique()
+    )
+    codigos_set = set(codigos)
+    
+    def es_cuenta_hoja(codigo: str) -> bool:
+        """Verifica si un código es hoja (no es prefijo de otro código)."""
+        codigo_limpio = str(codigo).replace(".0", "")
+        for otro_codigo in codigos_set:
+            if otro_codigo != codigo_limpio and otro_codigo.startswith(codigo_limpio):
+                return False
+        return True
+    
+    # Crear máscara para filtrar solo cuentas hoja
+    df["_codigo_limpio"] = (
+        df["Código cuenta contable"]
+        .astype(str)
+        .str.replace(".0", "", regex=False)
+    )
+    df["_es_hoja"] = df["_codigo_limpio"].apply(es_cuenta_hoja)
+    
+    # Filtrar y limpiar columnas temporales
+    df_filtered = df[df["_es_hoja"]].copy()
+    df_filtered = df_filtered.drop(columns=["_codigo_limpio", "_es_hoja"])
+    
+    return df_filtered
+
+
+def calcular_valor_cuenta(row: pd.Series) -> float:
+    """
+    Calcula el valor de una cuenta según su tipo (primer dígito del código).
+    
+    Fórmulas según el PUC Colombia:
+    - Cuentas 1, 2, 3 (Balance): Saldo Final
+    - Cuenta 4 (Ingresos): Crédito - Débito
+    - Cuentas 5, 6, 7 (Gastos/Costos): Débito - Crédito
+    - Cuentas 8, 9 (Orden): Saldo Final
+    
+    Args:
+        row: Fila del DataFrame con columnas 'Código str', 'Saldo final',
+             'Movimiento débito', 'Movimiento crédito'
+             
+    Returns:
+        Valor calculado según el tipo de cuenta
+    """
+    primer_digito = row["Código str"][0] if row["Código str"] else "0"
+    saldo_final = row.get("Saldo final", 0) or 0
+    debito = row.get("Movimiento débito", 0) or 0
+    credito = row.get("Movimiento crédito", 0) or 0
+    
+    if primer_digito in ["1", "2", "3", "8", "9"]:
+        # Cuentas de Balance y Orden: usar Saldo Final
+        return saldo_final
+    elif primer_digito == "4":
+        # Ingresos: Crédito - Débito (ingresos se registran en el crédito)
+        return credito - debito
+    elif primer_digito in ["5", "6", "7"]:
+        # Gastos y Costos: Débito - Crédito (gastos se registran en el débito)
+        return debito - credito
+    else:
+        # Fallback: usar Saldo Final
+        return saldo_final
+
+
 def read_siigo_excel(file_obj) -> pd.DataFrame:
     """Read the SIIGO Excel export assuming header on row 8 (header=7)."""
     excel = pd.ExcelFile(file_obj)
@@ -172,18 +261,18 @@ def process_dataframe(
     """
     # Display df.head() in UI outside this function.
 
-    # Filter Transaccional: cuando desglosamos por tercero, incluimos "Sí" y "No"
-    # De lo contrario, solo "No" (comportamiento original)
+    # Filter Transaccional:
+    # - Cuando desglosamos por tercero: usar registros detallados (Transaccional="Sí")
+    #   para evitar duplicados con subtotales
+    # - Cuando NO desglosamos: usar subtotales ya agregados (Transaccional="No")
     if desglosar_por_tercero:
-        df_filtered = df.copy()  # Incluir todas las filas (Sí y No)
+        df_filtered = df[df["Transaccional"] == "Sí"].copy()  # Solo registros detallados
     else:
-        df_filtered = df[df["Transaccional"] == "No"].copy()
+        df_filtered = df[df["Transaccional"] == "No"].copy()  # Solo subtotales
 
-    # Remove specified columns (exactly as notebook)
+    # Remove specified columns (keep Movimiento débito/crédito for value calculation)
     columns_to_drop = [
         "Saldo inicial",
-        "Movimiento débito",
-        "Movimiento crédito",
         "Sucursal",
         "Identificación",
     ]
@@ -202,10 +291,15 @@ def process_dataframe(
             "Nombre cuenta contable",
         ]
 
-    # Agrupar y sumar Saldo final, manteniendo las columnas clave
+    # Agrupar y sumar valores, manteniendo las columnas clave
+    # Incluimos débito y crédito para calcular el valor según tipo de cuenta
     df_unique_accounts = (
         df_filtered.groupby(group_keys, as_index=False, dropna=False)
-        .agg({"Saldo final": "sum"})
+        .agg({
+            "Saldo final": "sum",
+            "Movimiento débito": "sum",
+            "Movimiento crédito": "sum",
+        })
     )
 
     # Si no se desglosa por tercero, garantizamos la columna para el flujo posterior
@@ -244,7 +338,8 @@ def process_dataframe(
         + " - "
         + df_unique_accounts["Nombre cuenta contable"].fillna("")
     )
-    df_unique_accounts["VALOR"] = df_unique_accounts["Saldo final"]
+    # Calcular VALOR según tipo de cuenta (1-3: saldo final, 4: Cr-Db, 5-7: Db-Cr)
+    df_unique_accounts["VALOR"] = df_unique_accounts.apply(calcular_valor_cuenta, axis=1)
     df_unique_accounts["TERCERO"] = df_unique_accounts["Nombre tercero"]
 
     # DataFrame final con el formato deseado
@@ -264,13 +359,10 @@ def process_dataframe(
         (df_final["GRUPO"] != "NO CLASIFICADO") & (df_final["SUBGRUPO"] != "NO DEFINIDO")
     ].copy()
 
-    # Filter by length of the 'Código cuenta contable' column (after stripping .0) length >= 6
-    df_final = df_final[
-        df_final["Código cuenta contable"].astype(str).str.replace(
-            ".0", "", regex=False
-        ).str.len()
-        >= 6
-    ].copy()
+    # Filtrar para obtener solo las cuentas de mayor detalle (hojas del árbol contable)
+    # Una cuenta es "hoja" si no es prefijo de otra cuenta en el dataset
+    # Esto evita duplicar valores de subtotales con sus componentes
+    df_final = _filter_leaf_accounts(df_final)
 
     # Convert to get first digit and split
     df_final = df_final.copy()
