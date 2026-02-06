@@ -247,6 +247,114 @@ def create_excel_download_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
     return output.getvalue()
 
 
+def _find_orphan_transactional_accounts(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Encuentra cuentas "huérfanas": subcuentas que solo existen como Transaccional="Sí"
+    y no tienen un resumen Transaccional="No".
+
+    En SIIGO, la mayoría de subcuentas tienen esta estructura:
+        510506 (Subcuenta, Trans=No)   ← subtotal/resumen
+          └── 51050601 (Auxiliar, Trans=Sí)  ← detalle por tercero
+
+    Pero algunas subcuentas solo tienen entradas Transaccional="Sí" sin resumen "No":
+        510518 (Subcuenta, Trans=Sí)   ← sin resumen, solo detalle
+          └── (sin hijos)
+
+    Cuando filtramos por Transaccional="No", estas cuentas se pierden.
+    Esta función las detecta y agrega sus valores para incluirlas.
+
+    Criterio para considerar una cuenta "huérfana":
+      1. Solo tiene filas Transaccional="Sí" (no tiene resumen "No")
+      2. Es cuenta hoja (ningún otro código empieza con ella)
+      3. Ningún ancestro (código padre) es hoja en el subconjunto Trans="No"
+         → Esto evita incluir Auxiliares (8 dígitos) cuyo Subcuenta padre
+           (6 dígitos) ya tiene un resumen "No" que cubre ese detalle.
+
+    Args:
+        df: DataFrame original completo (sin filtrar).
+
+    Returns:
+        DataFrame con las cuentas huérfanas agregadas (sumadas por cuenta).
+    """
+    # Limpiar códigos como strings
+    df = df.copy()
+    df["_cod_str"] = df["Código cuenta contable"].apply(
+        lambda x: str(int(float(x))) if pd.notna(x) else ""
+    )
+
+    # Códigos que tienen al menos una fila Transaccional="No"
+    codes_with_no = set(
+        df.loc[df["Transaccional"] == "No", "_cod_str"].unique()
+    )
+    codes_with_no.discard("")
+
+    # Códigos que SOLO tienen Transaccional="Sí" (nunca tienen "No")
+    df_si = df[df["Transaccional"] == "Sí"].copy()
+    codes_only_si = set(df_si["_cod_str"].unique()) - codes_with_no
+    codes_only_si.discard("")
+
+    if not codes_only_si:
+        return pd.DataFrame()
+
+    # Todos los códigos en el dataset completo
+    all_codes = set(df["_cod_str"].unique())
+    all_codes.discard("")
+
+    # Paso 1: Identificar cuáles códigos Trans="No" son hojas dentro del subset "No"
+    # (no tienen otro código "No" más largo que empiece por ellos)
+    codes_no_leaves = set()
+    for code in codes_with_no:
+        is_leaf_in_no = not any(
+            other != code and other.startswith(code) for other in codes_with_no
+        )
+        if is_leaf_in_no:
+            codes_no_leaves.add(code)
+
+    # Paso 2: Filtrar cuentas solo-Sí que son hojas en el dataset completo
+    # Y que NO tienen un ancestro que sea hoja en el subset "No"
+    orphan_leaf_codes = set()
+    for code in codes_only_si:
+        # ¿Es hoja en el dataset completo? (ningún otro código empieza con ella)
+        is_leaf = not any(
+            other != code and other.startswith(code) for other in all_codes
+        )
+        if not is_leaf:
+            continue
+
+        # ¿Tiene algún ancestro que sea hoja en el subset "No"?
+        # Ej: 11050501 empieza con 110505 (que es hoja en "No") → NO es huérfana
+        # Ej: 510518 NO empieza con ninguna hoja "No" → SÍ es huérfana
+        has_no_leaf_ancestor = any(
+            code.startswith(no_leaf) and code != no_leaf
+            for no_leaf in codes_no_leaves
+        )
+        if has_no_leaf_ancestor:
+            continue
+
+        orphan_leaf_codes.add(code)
+
+    if not orphan_leaf_codes:
+        return pd.DataFrame()
+
+    # Filtrar solo las filas Sí de esas cuentas huérfanas y agregar
+    df_orphans = df_si[df_si["_cod_str"].isin(orphan_leaf_codes)].copy()
+
+    df_aggregated = (
+        df_orphans.groupby(
+            ["Código cuenta contable", "Nombre cuenta contable"],
+            as_index=False,
+            dropna=False,
+        )
+        .agg({
+            "Saldo final": "sum",
+            "Movimiento débito": "sum",
+            "Movimiento crédito": "sum",
+        })
+    )
+
+    return df_aggregated
+
+
 def process_dataframe(
     df: pd.DataFrame, mes: str, estado: str, anio: str, centro_costos: str, desglosar_por_tercero: bool = False
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
@@ -265,10 +373,22 @@ def process_dataframe(
     # - Cuando desglosamos por tercero: usar registros detallados (Transaccional="Sí")
     #   para evitar duplicados con subtotales
     # - Cuando NO desglosamos: usar subtotales ya agregados (Transaccional="No")
+    #   PLUS cuentas huérfanas que solo existen como "Sí" (ver _find_orphan_transactional_accounts)
     if desglosar_por_tercero:
         df_filtered = df[df["Transaccional"] == "Sí"].copy()  # Solo registros detallados
     else:
         df_filtered = df[df["Transaccional"] == "No"].copy()  # Solo subtotales
+
+        # Incluir cuentas hoja que solo existen como Transaccional="Sí"
+        # (SIIGO no genera resumen "No" para ellas porque ya son el nivel más bajo)
+        df_orphans = _find_orphan_transactional_accounts(df)
+        if not df_orphans.empty:
+            # Asegurar que las columnas coincidan antes de concatenar
+            for col in df_filtered.columns:
+                if col not in df_orphans.columns:
+                    df_orphans[col] = pd.NA
+            df_orphans = df_orphans[[c for c in df_filtered.columns if c in df_orphans.columns]]
+            df_filtered = pd.concat([df_filtered, df_orphans], ignore_index=True)
 
     # Remove specified columns (keep Movimiento débito/crédito for value calculation)
     columns_to_drop = [
