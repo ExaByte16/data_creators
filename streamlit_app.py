@@ -210,6 +210,70 @@ def read_siigo_excel(file_obj) -> pd.DataFrame:
     return df
 
 
+def read_datax_excel(file_obj) -> pd.DataFrame:
+    """Read the Datax Balance de Comprobación Excel. Header is on row 1 (header=0)."""
+    df = pd.read_excel(file_obj, header=0)
+    return df
+
+
+def normalize_datax_to_siigo(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normaliza un DataFrame de Datax al formato interno equivalente al de Siigo,
+    permitiendo reutilizar todo el pipeline de procesamiento existente.
+
+    Estructura Datax:
+        cuenta, nom_cuenta, cod_benf, nom_benf, saldo_ini, debitos, creditos,
+        saldo, nivel, tipo, orden, ter_benf
+
+    Reglas de conversión:
+    - tipo='T': subtotales intermedios → se descartan
+    - tipo='D', cod_benf=NaN, ter_benf=True  → fila resumen por cuenta
+                                                → Transaccional='No'
+    - tipo='D', cod_benf≠NaN                 → fila detalle por tercero
+                                                → Transaccional='Sí'
+    - tipo='D', cod_benf=NaN, ter_benf=False → cuenta hoja sin terceros;
+                                                se marca Transaccional='Sí'
+                                                para que la lógica de cuentas
+                                                huérfanas la detecte y la incluya
+                                                correctamente en ambos modos.
+    """
+    df = df.copy()
+
+    # 1. Eliminar filas de metadatos (cuenta vacía o NaN)
+    df = df[df["cuenta"].notna() & (df["cuenta"].astype(str).str.strip() != "")].copy()
+
+    # 2. Eliminar filas de subtotales intermedios (tipo='T')
+    df = df[df["tipo"] == "D"].copy()
+
+    # 3. Crear columna Transaccional equivalente a la de Siigo
+    def _get_transaccional(row) -> str:
+        if pd.notna(row["cod_benf"]):
+            return "Sí"  # detalle por tercero
+        elif bool(row.get("ter_benf", False)):
+            return "No"  # fila resumen de cuenta con terceros
+        else:
+            return "Sí"  # cuenta hoja sin terceros → tratada como huérfana
+
+    df["Transaccional"] = df.apply(_get_transaccional, axis=1)
+
+    # 4. Renombrar columnas al formato interno del pipeline
+    df = df.rename(columns={
+        "cuenta":     "Código cuenta contable",
+        "nom_cuenta": "Nombre cuenta contable",
+        "nom_benf":   "Nombre tercero",
+        "saldo_ini":  "Saldo inicial",
+        "debitos":    "Movimiento débito",
+        "creditos":   "Movimiento crédito",
+        "saldo":      "Saldo final",
+    })
+
+    # 5. Agregar columnas dummy requeridas por el pipeline (se descartan más adelante)
+    df["Sucursal"] = ""
+    df["Identificación"] = ""
+
+    return df
+
+
 def validate_required_columns(df: pd.DataFrame) -> None:
     """Ensure the DataFrame contains required columns used by the notebook."""
     required_columns = {
@@ -537,28 +601,49 @@ def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
     st.caption(
-        "Este app procesa y agrupa un export de un periodo de operación mensual de SIIGO, "
-        "generando Balance General y Estado de Resultados en Excel."
+        "Este app procesa y agrupa un export de un periodo de operación mensual "
+        "(SIIGO o Datax), generando Balance General y Estado de Resultados en Excel."
+    )
+
+    # Selector de formato
+    formato = st.radio(
+        "Formato del archivo de entrada",
+        options=["Siigo", "Datax"],
+        horizontal=True,
     )
 
     with st.expander("Instrucciones", expanded=True):
+        if formato == "Siigo":
+            st.markdown("- Cargue el archivo Excel exportado de **SIIGO**.")
+            st.markdown(
+                "- El encabezado del archivo debe estar en la fila 8 (header=7)."
+            )
+        else:
+            st.markdown(
+                "- Cargue el archivo Excel de **Balance de Comprobación de Datax**."
+            )
+            st.markdown(
+                "- El encabezado debe estar en la primera fila "
+                "(columnas: `cuenta`, `nom_cuenta`, `cod_benf`, `nom_benf`, "
+                "`saldo_ini`, `debitos`, `creditos`, `saldo`, `nivel`, `tipo`, "
+                "`orden`, `ter_benf`)."
+            )
+        st.markdown("- Ingrese MES, ESTADO, AÑO y CENTRO DE COSTOS.")
         st.markdown(
-            "- Cargue el archivo Excel exportado de SIIGO."
+            "- Descargue un ZIP con `datos_balance_general.xlsx` y "
+            "`datos_estado_resultados.xlsx`."
         )
         st.markdown(
-            "- El encabezado del archivo debe estar en la fila 8 (header=7), igual que en el notebook."
-        )
-        st.markdown(
-            "- Ingrese MES, ESTADO, AÑO y CENTRO DE COSTOS."
-        )
-        st.markdown(
-            "- Descargue un ZIP con 'datos_balance_general.xlsx' y 'datos_estado_resultados.xlsx'."
-        )
-        st.markdown(
-            "- Nota: Si no se logra determinar 'Nombre tercero' en el archivo, la columna TERCERO se llenará en blanco."
+            "- Nota: Si no se puede determinar 'Nombre tercero', la columna "
+            "TERCERO se llenará en blanco."
         )
 
-    uploaded_file = st.file_uploader("Suba el archivo Excel de SIIGO", type=["xlsx"])
+    label_uploader = (
+        "Suba el archivo Excel de SIIGO"
+        if formato == "Siigo"
+        else "Suba el archivo Excel de Datax (Balance de Comprobación)"
+    )
+    uploaded_file = st.file_uploader(label_uploader, type=["xlsx"])
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -585,17 +670,22 @@ def main() -> None:
             st.stop()
 
         try:
-            # Read Excel
-            raw_df = read_siigo_excel(uploaded_file)
-            # Optional: minimal preview to confirm load (first rows only)
+            # Leer y normalizar según el formato seleccionado
+            if formato == "Siigo":
+                raw_df = read_siigo_excel(uploaded_file)
+            else:
+                raw_df = read_datax_excel(uploaded_file)
+                raw_df = normalize_datax_to_siigo(raw_df)
+
+            # Vista previa (primeras filas del archivo ya procesado)
             st.subheader("Vista previa (primeras filas)")
             st.dataframe(raw_df.head())
 
-            # Validate columns and ensure 'Nombre tercero'
+            # Validar columnas y garantizar 'Nombre tercero'
             validate_required_columns(raw_df)
             raw_df = ensure_nombre_tercero(raw_df)
 
-            # Process DataFrame (exact notebook logic)
+            # Procesar el DataFrame (lógica del notebook)
             (
                 datos_balance_general,
                 datos_estado_resultados,
@@ -605,7 +695,7 @@ def main() -> None:
                 _df_unique_accounts_info_text,
             ) = process_dataframe(raw_df, mes, estado, anio, centro_costos, desglosar_por_tercero)
 
-            # Build Excel bytes
+            # Construir bytes Excel
             bg_bytes = create_excel_download_bytes(
                 datos_balance_general, sheet_name="datos_balance_general"
             )
@@ -613,7 +703,7 @@ def main() -> None:
                 datos_estado_resultados, sheet_name="datos_estado_resultados"
             )
 
-            # Create ZIP in-memory
+            # Crear ZIP en memoria
             zip_buffer = BytesIO()
             with ZipFile(zip_buffer, mode="w") as zf:
                 zf.writestr("datos_balance_general.xlsx", bg_bytes)
