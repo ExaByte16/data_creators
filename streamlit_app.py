@@ -23,6 +23,8 @@ from typing import Tuple
 import pandas as pd
 import streamlit as st
 
+from report_generator import generate_informe, make_branding
+
 
 APP_TITLE = "Oxynia Balance General"
 
@@ -659,6 +661,42 @@ def main() -> None:
         "Desglosar por TERCERO en los reportes finales", value=True
     )
 
+    st.divider()
+    st.subheader("Branding e Informe Completo")
+    st.caption(
+        "Opcional: configure datos de branding para generar el INFORME completo "
+        "con formato profesional, gráficas, colores y firmas."
+    )
+
+    generar_informe_flag = st.checkbox("Generar INFORME completo (Excel con formato)", value=False)
+
+    branding_config = {}
+    if generar_informe_flag:
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
+            branding_empresa = st.text_input("Nombre de la empresa", value="")
+            branding_nit = st.text_input("NIT", value="")
+            branding_rep_legal = st.text_input("Representante Legal", value="")
+            branding_rep_cc = st.text_input("C.C. Representante", value="")
+        with col_b2:
+            branding_contador = st.text_input("Contador(a)", value="")
+            branding_contador_tp = st.text_input("T.P. Contador(a)", value="")
+            branding_contador_cc = st.text_input("C.C. Contador(a)", value="")
+            branding_logo = st.file_uploader("Logo (PNG/JPG)", type=["png", "jpg", "jpeg"])
+
+        logo_bytes = branding_logo.read() if branding_logo else None
+        branding_config = make_branding(
+            empresa=branding_empresa,
+            nit=branding_nit,
+            representante_legal=branding_rep_legal,
+            representante_cc=branding_rep_cc,
+            contador=branding_contador,
+            contador_tp=branding_contador_tp,
+            contador_cc=branding_contador_cc,
+            logo_bytes=logo_bytes,
+        )
+
+    st.divider()
     process_clicked = st.button("Procesar y Generar Archivos")
 
     if process_clicked:
@@ -711,13 +749,32 @@ def main() -> None:
             zip_buffer.seek(0)
 
             st.download_button(
-                label="Descargar resultados.zip",
+                label="Descargar resultados.zip (datos crudos)",
                 data=zip_buffer.getvalue(),
                 file_name="resultados.zip",
                 mime="application/zip",
             )
 
-            st.success("ZIP generado con ambos archivos Excel.")
+            st.success("ZIP generado con ambos archivos Excel (datos crudos).")
+
+            # --- INFORME COMPLETO ---
+            if generar_informe_flag:
+                with st.spinner("Generando INFORME completo con formato..."):
+                    periodo_label = f"{mes} de {anio}" if mes and anio else f"{mes} {anio}"
+                    informe_bytes = generate_informe(
+                        df_balance=datos_balance_general,
+                        df_er=datos_estado_resultados,
+                        branding=branding_config,
+                        periodo_actual=periodo_label,
+                    )
+
+                st.download_button(
+                    label="Descargar INFORME completo (.xlsx)",
+                    data=informe_bytes,
+                    file_name="INFORME.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                st.success("INFORME completo generado con formato profesional.")
 
         except Exception as exc:  # noqa: BLE001
             st.error(f"Error procesando el archivo: {exc}")
