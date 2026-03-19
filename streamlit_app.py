@@ -696,6 +696,20 @@ def main() -> None:
             logo_bytes=logo_bytes,
         )
 
+        st.markdown("**Período anterior (opcional — para comparativo en el INFORME)**")
+        st.caption(
+            "Si sube este archivo, el INFORME mostrará la columna comparativa "
+            "con cifras reales del período anterior."
+        )
+        uploaded_file_anterior = st.file_uploader(
+            "Archivo del período anterior (mismo formato)", type=["xlsx"], key="anterior"
+        )
+        col_a1, col_a2 = st.columns(2)
+        with col_a1:
+            mes_anterior = st.text_input("MES anterior", value="")
+        with col_a2:
+            anio_anterior = st.text_input("AÑO anterior", value="")
+
     st.divider()
     process_clicked = st.button("Procesar y Generar Archivos")
 
@@ -761,11 +775,35 @@ def main() -> None:
             if generar_informe_flag:
                 with st.spinner("Generando INFORME completo con formato..."):
                     periodo_label = f"{mes} de {anio}" if mes and anio else f"{mes} {anio}"
+
+                    # Procesar período anterior si fue provisto
+                    periodo_ant_label = None
+                    df_balance_ant = None
+                    df_er_ant = None
+                    if uploaded_file_anterior is not None:
+                        if formato == "Siigo":
+                            raw_df_ant = read_siigo_excel(uploaded_file_anterior)
+                        else:
+                            raw_df_ant = read_datax_excel(uploaded_file_anterior)
+                            raw_df_ant = normalize_datax_to_siigo(raw_df_ant)
+                        raw_df_ant = ensure_nombre_tercero(raw_df_ant)
+                        mes_ant = mes_anterior or mes
+                        anio_ant = anio_anterior or anio
+                        (df_balance_ant, df_er_ant, *_) = process_dataframe(
+                            raw_df_ant, mes_ant, estado, anio_ant, centro_costos, desglosar_por_tercero
+                        )
+                        periodo_ant_label = (
+                            f"{mes_ant} de {anio_ant}" if mes_ant and anio_ant else f"{mes_ant} {anio_ant}"
+                        )
+
                     informe_bytes = generate_informe(
                         df_balance=datos_balance_general,
                         df_er=datos_estado_resultados,
                         branding=branding_config,
                         periodo_actual=periodo_label,
+                        periodo_anterior=periodo_ant_label,
+                        df_balance_anterior=df_balance_ant,
+                        df_er_anterior=df_er_ant,
                     )
 
                 st.download_button(
