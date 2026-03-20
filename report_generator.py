@@ -20,6 +20,7 @@ from openpyxl.chart import BarChart, PieChart, Reference
 from openpyxl.drawing.image import Image as XlImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.properties import Outline
 
 # ---------------------------------------------------------------------------
 # NIIF presentation names for each SUBGRUPO (used in EF)
@@ -136,6 +137,7 @@ FONT_SECTION = Font(name="Arial Narrow", size=9, bold=True, color=COL_BLACK)
 FONT_FIRMA = Font(name="Arial Narrow", size=9, color=COL_BLACK)
 FONT_FIRMA_BOLD = Font(name="Arial Narrow", size=9, bold=True, color=COL_BLACK)
 FONT_FILTRO = Font(name="Arial Narrow", size=8, color=COL_GRAY)
+FONT_DETAIL = Font(name="Arial Narrow", size=8, color="666666")
 
 FILL_TEAL_DARK = PatternFill(start_color=COL_TEAL_DARK, end_color=COL_TEAL_DARK, fill_type="solid")
 FILL_TEAL_MED = PatternFill(start_color=COL_TEAL_MED, end_color=COL_TEAL_MED, fill_type="solid")
@@ -232,6 +234,265 @@ def _aggregate_gastos_4dig(df: pd.DataFrame, prefix_2dig: str) -> pd.DataFrame:
     agg = agg[agg["VALOR"] != 0].sort_values("CODE_4")
     agg["LABEL"] = agg["CODE_4"].map(GASTOS_4DIG_NAMES).fillna("Otros gastos")
     return agg
+
+
+# ---------------------------------------------------------------------------
+# Helpers for drill-down detail rows
+# ---------------------------------------------------------------------------
+def _get_detail_for_subgrupo(df, sg_code):
+    """Filter DataFrame by 2-digit subgrupo, group by CUENTA with terceros."""
+    if df is None or df.empty:
+        return []
+    df = df.copy()
+    df["_code"] = df["CUENTA"].astype(str).str.extract(r'^(\d+)')[0]
+    mask = df["_code"].str[:2] == sg_code
+    filtered = df[mask]
+    if filtered.empty:
+        return []
+    result = []
+    for cuenta_key, cuenta_df in filtered.groupby("CUENTA", sort=True):
+        cuenta_val = cuenta_df["VALOR"].sum()
+        terceros = []
+        for _, t_row in cuenta_df.iterrows():
+            tercero = t_row.get("TERCERO", "")
+            if pd.notna(tercero) and str(tercero).strip():
+                terceros.append((str(tercero), _money(t_row["VALOR"])))
+        result.append((str(cuenta_key), cuenta_val, terceros))
+    return result
+
+
+def _write_ef_detail_rows(ws, row, detail, detail_ant_map, total_base, total_base_ant,
+                          base_level=1):
+    """Write cuenta + tercero detail rows with outline for EF sheet. Returns next row."""
+    for cuenta_key, cuenta_val, terceros in detail:
+        cuenta_code = cuenta_key.split(" - ")[0].strip() if " - " in cuenta_key else ""
+        cuenta_name = cuenta_key.split(" - ")[1].strip() if " - " in cuenta_key else cuenta_key
+
+        # Get anterior value for this cuenta
+        ant_info = detail_ant_map.get(cuenta_key, (0, []))
+        val_ant = ant_info[0]
+        var_val = cuenta_val - val_ant
+        pct_act = cuenta_val / total_base if total_base else 0
+        pct_ant = val_ant / total_base_ant if total_base_ant else 0
+        var_pct = (var_val / abs(val_ant)) if val_ant != 0 else 0
+
+        # Write cuenta row
+        _ef_data_row(ws, row, f"  {cuenta_code}", f"  {cuenta_name}", "",
+                     cuenta_val, pct_act, val_ant, pct_ant, var_val, var_pct, filtro=True)
+        # Override font to FONT_BODY (normal, not bold)
+        for c in range(1, 10):
+            ws.cell(row=row, column=c).font = FONT_BODY
+        ws.row_dimensions[row].outline_level = base_level
+        ws.row_dimensions[row].hidden = True
+        row += 1
+
+        # Terceros
+        ant_terceros = {t[0]: t[1] for t in ant_info[1]} if len(ant_info) > 1 else {}
+        for tercero_name, tercero_val in terceros:
+            t_val_ant = ant_terceros.get(tercero_name, 0)
+            t_var = tercero_val - t_val_ant
+            t_pct_act = tercero_val / total_base if total_base else 0
+            t_pct_ant = t_val_ant / total_base_ant if total_base_ant else 0
+            t_var_pct = (t_var / abs(t_val_ant)) if t_val_ant != 0 else 0
+
+            _ef_data_row(ws, row, "", f"    {tercero_name}", "",
+                         tercero_val, t_pct_act, t_val_ant, t_pct_ant, t_var, t_var_pct, filtro=True)
+            for c in range(1, 10):
+                ws.cell(row=row, column=c).font = FONT_DETAIL
+            ws.row_dimensions[row].outline_level = base_level + 1
+            ws.row_dimensions[row].hidden = True
+            row += 1
+
+    return row
+
+
+def _build_detail_ant_map(df_ant, sg_code):
+    """Build a dict {CUENTA: (total_val, [(tercero, val), ...])} for anterior."""
+    if df_ant is None or df_ant.empty:
+        return {}
+    df_ant = df_ant.copy()
+    df_ant["_code"] = df_ant["CUENTA"].astype(str).str.extract(r'^(\d+)')[0]
+    mask = df_ant["_code"].str[:2] == sg_code
+    filtered = df_ant[mask]
+    if filtered.empty:
+        return {}
+    result = {}
+    for cuenta_key, cuenta_df in filtered.groupby("CUENTA", sort=True):
+        cuenta_val = cuenta_df["VALOR"].sum()
+        terceros = []
+        for _, t_row in cuenta_df.iterrows():
+            tercero = t_row.get("TERCERO", "")
+            if pd.notna(tercero) and str(tercero).strip():
+                terceros.append((str(tercero), _money(t_row["VALOR"])))
+        result[str(cuenta_key)] = (cuenta_val, terceros)
+    return result
+
+
+def _write_er_detail_rows(ws, row, df_er, df_er_ant, sg_code, total_ingresos, total_ingresos_ant,
+                          base_level=1):
+    """Write cuenta + tercero detail rows for an ER subgrupo. Returns next row."""
+    detail = _get_detail_for_subgrupo(df_er, sg_code)
+    detail_ant_map = _build_detail_ant_map(df_er_ant, sg_code)
+
+    for cuenta_key, cuenta_val, terceros in detail:
+        cuenta_code = cuenta_key.split(" - ")[0].strip() if " - " in cuenta_key else ""
+        cuenta_name = cuenta_key.split(" - ")[1].strip() if " - " in cuenta_key else cuenta_key
+
+        ant_info = detail_ant_map.get(cuenta_key, (0, []))
+        val_ant = ant_info[0]
+        var_val = cuenta_val - val_ant
+
+        pct_act = cuenta_val / total_ingresos if total_ingresos else 0
+        pct_ant = val_ant / total_ingresos_ant if total_ingresos_ant else 0
+        var_pct = (var_val / abs(val_ant)) if val_ant != 0 else 0
+
+        indent = "  " * base_level
+        c = 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER); c += 1
+        _wc(ws, row, c, f"{indent}{cuenta_code} - {cuenta_name}", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_LEFT); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_CENTER); c += 1
+        _wc(ws, row, c, cuenta_val, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+        _wc(ws, row, c, pct_act, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, val_ant, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+        _wc(ws, row, c, pct_ant, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, var_val, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+        _wc(ws, row, c, var_pct, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, "TRUE", font=FONT_FILTRO)
+        ws.row_dimensions[row].outline_level = base_level
+        ws.row_dimensions[row].hidden = True
+        row += 1
+
+        # Terceros
+        ant_terceros = {t[0]: t[1] for t in ant_info[1]} if len(ant_info) > 1 else {}
+        for tercero_name, tercero_val in terceros:
+            t_val_ant = ant_terceros.get(tercero_name, 0)
+            t_var = tercero_val - t_val_ant
+            t_pct_act = tercero_val / total_ingresos if total_ingresos else 0
+            t_pct_ant = t_val_ant / total_ingresos_ant if total_ingresos_ant else 0
+            t_var_pct = (t_var / abs(t_val_ant)) if t_val_ant != 0 else 0
+
+            indent2 = "  " * (base_level + 1)
+            c = 1
+            _wc(ws, row, c, "", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER); c += 1
+            _wc(ws, row, c, f"{indent2}{tercero_name}", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_LEFT); c += 1
+            _wc(ws, row, c, "", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_CENTER); c += 1
+            _wc(ws, row, c, tercero_val, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+            _wc(ws, row, c, t_pct_act, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, t_val_ant, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+            _wc(ws, row, c, t_pct_ant, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, t_var, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+            _wc(ws, row, c, t_var_pct, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, "TRUE", font=FONT_FILTRO)
+            ws.row_dimensions[row].outline_level = base_level + 1
+            ws.row_dimensions[row].hidden = True
+            row += 1
+
+    return row
+
+
+def _get_detail_for_4dig(df, code4):
+    """Filter DataFrame by 4-digit prefix, group by CUENTA with terceros."""
+    if df is None or df.empty:
+        return []
+    df = df.copy()
+    df["_code"] = df["CUENTA"].astype(str).str.extract(r'^(\d+)')[0]
+    mask = df["_code"].str[:4] == code4
+    filtered = df[mask]
+    if filtered.empty:
+        return []
+    result = []
+    for cuenta_key, cuenta_df in filtered.groupby("CUENTA", sort=True):
+        cuenta_val = cuenta_df["VALOR"].sum()
+        terceros = []
+        for _, t_row in cuenta_df.iterrows():
+            tercero = t_row.get("TERCERO", "")
+            if pd.notna(tercero) and str(tercero).strip():
+                terceros.append((str(tercero), _money(t_row["VALOR"])))
+        result.append((str(cuenta_key), cuenta_val, terceros))
+    return result
+
+
+def _build_detail_ant_map_4dig(df_ant, code4):
+    """Build anterior map for a 4-digit prefix."""
+    if df_ant is None or df_ant.empty:
+        return {}
+    df_ant = df_ant.copy()
+    df_ant["_code"] = df_ant["CUENTA"].astype(str).str.extract(r'^(\d+)')[0]
+    mask = df_ant["_code"].str[:4] == code4
+    filtered = df_ant[mask]
+    if filtered.empty:
+        return {}
+    result = {}
+    for cuenta_key, cuenta_df in filtered.groupby("CUENTA", sort=True):
+        cuenta_val = cuenta_df["VALOR"].sum()
+        terceros = []
+        for _, t_row in cuenta_df.iterrows():
+            tercero = t_row.get("TERCERO", "")
+            if pd.notna(tercero) and str(tercero).strip():
+                terceros.append((str(tercero), _money(t_row["VALOR"])))
+        result[str(cuenta_key)] = (cuenta_val, terceros)
+    return result
+
+
+def _write_er_4dig_detail_rows(ws, row, df_er, df_er_ant, code4,
+                                total_ingresos, total_ingresos_ant, base_level=2):
+    """Write cuenta + tercero detail rows for a 4-digit gastos category."""
+    detail = _get_detail_for_4dig(df_er, code4)
+    detail_ant_map = _build_detail_ant_map_4dig(df_er_ant, code4)
+
+    for cuenta_key, cuenta_val, terceros in detail:
+        cuenta_code = cuenta_key.split(" - ")[0].strip() if " - " in cuenta_key else ""
+        cuenta_name = cuenta_key.split(" - ")[1].strip() if " - " in cuenta_key else cuenta_key
+
+        ant_info = detail_ant_map.get(cuenta_key, (0, []))
+        val_ant = ant_info[0]
+        var_val = cuenta_val - val_ant
+        pct_act = cuenta_val / total_ingresos if total_ingresos else 0
+        pct_ant = val_ant / total_ingresos_ant if total_ingresos_ant else 0
+        var_pct = (var_val / abs(val_ant)) if val_ant != 0 else 0
+
+        indent = "  " * base_level
+        c = 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER); c += 1
+        _wc(ws, row, c, f"{indent}{cuenta_code} - {cuenta_name}", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_LEFT); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_CENTER); c += 1
+        _wc(ws, row, c, cuenta_val, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+        _wc(ws, row, c, pct_act, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, val_ant, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+        _wc(ws, row, c, pct_ant, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, var_val, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+        _wc(ws, row, c, var_pct, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, "TRUE", font=FONT_FILTRO)
+        ws.row_dimensions[row].outline_level = base_level
+        ws.row_dimensions[row].hidden = True
+        row += 1
+
+        # Terceros
+        ant_terceros = {t[0]: t[1] for t in ant_info[1]} if len(ant_info) > 1 else {}
+        for tercero_name, tercero_val in terceros:
+            t_val_ant = ant_terceros.get(tercero_name, 0)
+            t_var = tercero_val - t_val_ant
+            t_pct_act = tercero_val / total_ingresos if total_ingresos else 0
+            t_pct_ant = t_val_ant / total_ingresos_ant if total_ingresos_ant else 0
+            t_var_pct = (t_var / abs(t_val_ant)) if t_val_ant != 0 else 0
+
+            indent2 = "  " * (base_level + 1)
+            c = 1
+            _wc(ws, row, c, "", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER); c += 1
+            _wc(ws, row, c, f"{indent2}{tercero_name}", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_LEFT); c += 1
+            _wc(ws, row, c, "", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_CENTER); c += 1
+            _wc(ws, row, c, tercero_val, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+            _wc(ws, row, c, t_pct_act, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, t_val_ant, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+            _wc(ws, row, c, t_pct_ant, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, t_var, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+            _wc(ws, row, c, t_var_pct, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, "TRUE", font=FONT_FILTRO)
+            ws.row_dimensions[row].outline_level = base_level + 1
+            ws.row_dimensions[row].hidden = True
+            row += 1
+
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +619,7 @@ def _ef_data_row(ws, row, code, name, nota, val_actual, pct_actual, val_ant, pct
 # ---------------------------------------------------------------------------
 def _build_ef_sheet(wb, df_balance, branding, periodo_actual, periodo_anterior=None, df_balance_anterior=None):
     ws = wb.create_sheet("EF")
+    ws.sheet_properties.outlinePr = Outline(summaryBelow=False)
     merge_cols = 9
 
     row = _write_header(ws, branding, "ESTADO DE SITUACIÓN FINANCIERA",
@@ -453,6 +715,14 @@ def _build_ef_sheet(wb, df_balance, branding, periodo_actual, periodo_anterior=N
                              val, pct_act, val_ant, pct_ant_v, var_val, var_pct, filtro=True)
                 row += 1
 
+                # Detail: cuentas + terceros (collapsed)
+                detail = _get_detail_for_subgrupo(df_balance, sg_code)
+                detail_ant_map = _build_detail_ant_map(df_balance_anterior, sg_code)
+                row = _write_ef_detail_rows(
+                    ws, row, detail, detail_ant_map,
+                    total_activo, total_activo_ant, base_level=1
+                )
+
             # Section total
             var_sec = section_val - section_ant
             pct_sec = section_val / total_activo if total_activo else 0
@@ -510,6 +780,7 @@ def _build_ef_sheet(wb, df_balance, branding, periodo_actual, periodo_anterior=N
 def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
                     periodo_anterior=None, df_er_anterior=None):
     ws = wb.create_sheet("ER")
+    ws.sheet_properties.outlinePr = Outline(summaryBelow=False)
     merge_cols = 9
 
     row = _write_header(ws, branding, "ESTADO DE RESULTADO INTEGRAL",
@@ -590,12 +861,19 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
 
     # Ventas (41)
     _row_item("Venta de producto y prestación de servicios", ingresos_41, ingresos_41_ant, note=True)
+    # Detail for 41 (level 1 = cuenta, level 2 = tercero)
+    row = _write_er_detail_rows(ws, row, df_er, df_er_anterior, "41",
+                                total_ingresos, total_ingresos_ant, base_level=1)
 
     # Costos de ventas (61, 62, 71-74)
     costo_codes = ["61", "62", "71", "72", "73", "74"]
     costos = sum(_get_val(c) for c in costo_codes)
     costos_ant = sum(_get_val_ant(c) for c in costo_codes)
     _row_item("MENOS:  COSTO DE VENTAS", costos, costos_ant)
+    # Detail for each costo code
+    for costo_sg in costo_codes:
+        row = _write_er_detail_rows(ws, row, df_er, df_er_anterior, costo_sg,
+                                    total_ingresos, total_ingresos_ant, base_level=1)
 
     # UTILIDAD BRUTA
     util_bruta = ingresos_41 - costos
@@ -621,6 +899,12 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
         if val == 0 and val_ant == 0:
             continue
         _row_item(f"  {label}", val, val_ant)
+        # Mark 4-digit row as outline_level=1
+        ws.row_dimensions[row - 1].outline_level = 1
+        ws.row_dimensions[row - 1].hidden = True
+        # Detail: cuentas + terceros within this 4-digit category
+        row = _write_er_4dig_detail_rows(ws, row, df_er, df_er_anterior, code4,
+                                          total_ingresos, total_ingresos_ant, base_level=2)
 
     _row_item("Total Gastos de administración", gastos_admin, gastos_admin_ant, note=True)
 
@@ -643,6 +927,12 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
         if val == 0 and val_ant == 0:
             continue
         _row_item(f"  {label}", val, val_ant)
+        # Mark 4-digit row as outline_level=1
+        ws.row_dimensions[row - 1].outline_level = 1
+        ws.row_dimensions[row - 1].hidden = True
+        # Detail: cuentas + terceros within this 4-digit category
+        row = _write_er_4dig_detail_rows(ws, row, df_er, df_er_anterior, code4,
+                                          total_ingresos, total_ingresos_ant, base_level=2)
 
     _row_item("Total Gastos de Venta", gastos_venta, gastos_venta_ant)
 
@@ -655,11 +945,15 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
     ing_no_ord = _get_val("42")
     ing_no_ord_ant = _get_val_ant("42")
     _row_item("Ingresos no ordinarios", ing_no_ord, ing_no_ord_ant, note=True)
+    row = _write_er_detail_rows(ws, row, df_er, df_er_anterior, "42",
+                                total_ingresos, total_ingresos_ant, base_level=1)
 
     # Gastos no ordinarios (53)
     gtos_no_ord = _get_val("53")
     gtos_no_ord_ant = _get_val_ant("53")
     _row_item("Gastos no ordinarios", gtos_no_ord, gtos_no_ord_ant, note=True)
+    row = _write_er_detail_rows(ws, row, df_er, df_er_anterior, "53",
+                                total_ingresos, total_ingresos_ant, base_level=1)
 
     # UTILIDAD (PERDIDA) ANTES DE IMPUESTOS
     util_antes_imp = util_oper + ing_no_ord - gtos_no_ord
@@ -670,6 +964,8 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
     imp_renta = _get_val("54")
     imp_renta_ant = _get_val_ant("54")
     _row_item("Provisión Impuesto de Renta", imp_renta, imp_renta_ant)
+    row = _write_er_detail_rows(ws, row, df_er, df_er_anterior, "54",
+                                total_ingresos, total_ingresos_ant, base_level=1)
 
     # UTILIDAD NETA
     util_neta = util_antes_imp - imp_renta
@@ -689,6 +985,7 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
 # ---------------------------------------------------------------------------
 def _build_notas_sheet(wb, df_balance, df_er, branding, periodo_actual):
     ws = wb.create_sheet("Notas")
+    ws.sheet_properties.outlinePr = Outline(summaryBelow=False)
 
     row = _write_header(ws, branding, "NOTAS A LOS ESTADOS FINANCIEROS",
                         f"(Expresados en pesos colombianos) — {periodo_actual}", merge_cols=6)
@@ -739,6 +1036,8 @@ def _build_notas_sheet(wb, df_balance, df_er, branding, periodo_actual):
             _wc(ws, row, 2, nombre, font=FONT_BODY, border=THIN_BORDER, alignment=ALIGN_LEFT)
             _wc(ws, row, 3, tercero, font=FONT_BODY, border=THIN_BORDER, alignment=ALIGN_LEFT)
             _wc(ws, row, 4, val, font=FONT_BODY, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+            ws.row_dimensions[row].outline_level = 1
+            ws.row_dimensions[row].hidden = True
             row += 1
 
         _wc(ws, row, 1, "", fill=FILL_TEAL_LIGHT, border=THIN_BORDER)

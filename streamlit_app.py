@@ -779,6 +779,11 @@ def main() -> None:
                 with st.spinner("Generando INFORME completo con formato..."):
                     periodo_label = f"{mes} de {anio}" if mes and anio else f"{mes} {anio}"
 
+                    # El INFORME siempre incluye detalle de terceros (colapsado)
+                    (df_balance_informe, df_er_informe, *_) = process_dataframe(
+                        raw_df, mes, estado, anio, centro_costos, desglosar_por_tercero=True
+                    )
+
                     # Procesar período anterior si fue provisto
                     periodo_ant_label = None
                     df_balance_ant = None
@@ -793,15 +798,15 @@ def main() -> None:
                         mes_ant = mes_anterior or mes
                         anio_ant = anio_anterior or anio
                         (df_balance_ant, df_er_ant, *_) = process_dataframe(
-                            raw_df_ant, mes_ant, estado, anio_ant, centro_costos, desglosar_por_tercero
+                            raw_df_ant, mes_ant, estado, anio_ant, centro_costos, desglosar_por_tercero=True
                         )
                         periodo_ant_label = (
                             f"{mes_ant} de {anio_ant}" if mes_ant and anio_ant else f"{mes_ant} {anio_ant}"
                         )
 
                     informe_bytes = generate_informe(
-                        df_balance=datos_balance_general,
-                        df_er=datos_estado_resultados,
+                        df_balance=df_balance_informe,
+                        df_er=df_er_informe,
                         branding=branding_config,
                         periodo_actual=periodo_label,
                         periodo_anterior=periodo_ant_label,
