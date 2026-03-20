@@ -70,6 +70,22 @@ ER_NIIF_NAMES = {
     "74": "Contratos de servicios",
 }
 
+GASTOS_4DIG_NAMES = {
+    # 51 - Operacionales de administración
+    "5105": "Gastos de personal", "5110": "Honorarios",
+    "5115": "Impuestos", "5120": "Arrendamientos",
+    "5125": "Contribuciones y afiliaciones", "5130": "Seguros",
+    "5135": "Servicios", "5140": "Gastos legales",
+    "5145": "Mantenimiento y reparaciones", "5150": "Adecuación e instalación",
+    "5155": "Gastos de viaje", "5160": "Depreciaciones",
+    "5195": "Diversos", "5199": "Provisiones",
+    # 52 - Operacionales de ventas
+    "5205": "Gastos de personal", "5210": "Honorarios",
+    "5215": "Impuestos", "5220": "Arrendamientos",
+    "5235": "Servicios", "5240": "Gastos legales",
+    "5245": "Mantenimiento y reparaciones", "5295": "Diversos",
+}
+
 # Suffix C=Corriente, F=Fijo/No Corriente for the code display
 SUBGRUPO_SUFFIX = {
     "11": "C", "12": "C", "13": "C", "14": "C",
@@ -199,6 +215,23 @@ def _aggregate_by_subgrupo(df: pd.DataFrame) -> pd.DataFrame:
         VALOR=("VALOR", "sum")
     )
     return agg.sort_values("SUBGRUPO_COD")
+
+
+def _aggregate_gastos_4dig(df: pd.DataFrame, prefix_2dig: str) -> pd.DataFrame:
+    """Agrupa cuentas de gastos por prefijo de 4 dígitos."""
+    if df.empty:
+        return pd.DataFrame(columns=["CODE_4", "LABEL", "VALOR"])
+    df = df.copy()
+    df["_code"] = df["CUENTA"].astype(str).str.extract(r'^(\d+)')[0]
+    mask = df["_code"].str[:2] == prefix_2dig
+    df = df[mask].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["CODE_4", "LABEL", "VALOR"])
+    df["CODE_4"] = df["_code"].str[:4]
+    agg = df.groupby("CODE_4", as_index=False)["VALOR"].sum()
+    agg = agg[agg["VALOR"] != 0].sort_values("CODE_4")
+    agg["LABEL"] = agg["CODE_4"].map(GASTOS_4DIG_NAMES).fillna("Otros gastos")
+    return agg
 
 
 # ---------------------------------------------------------------------------
@@ -569,15 +602,49 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
     util_bruta_ant = ingresos_41_ant - costos_ant
     _row_item("UTILIDAD BRUTA", util_bruta, util_bruta_ant, total_bg=True)
 
-    # Gastos de administración (51)
+    # --- Gastos de administración (51) - desglosado ---
     gastos_admin = _get_val("51")
     gastos_admin_ant = _get_val_ant("51")
-    _row_item("Gastos de administración", gastos_admin, gastos_admin_ant, note=True)
 
-    # Gastos de venta (52)
+    sub_51 = _aggregate_gastos_4dig(df_er, "51")
+    sub_51_ant = _aggregate_gastos_4dig(df_er_anterior, "51") if df_er_anterior is not None else pd.DataFrame()
+
+    all_codes_51 = sorted(set(
+        sub_51["CODE_4"].tolist() +
+        (sub_51_ant["CODE_4"].tolist() if not sub_51_ant.empty else [])
+    ))
+
+    for code4 in all_codes_51:
+        label = GASTOS_4DIG_NAMES.get(code4, "Otros gastos")
+        val = sub_51.loc[sub_51["CODE_4"] == code4, "VALOR"].sum() if not sub_51.empty else 0
+        val_ant = sub_51_ant.loc[sub_51_ant["CODE_4"] == code4, "VALOR"].sum() if not sub_51_ant.empty else 0
+        if val == 0 and val_ant == 0:
+            continue
+        _row_item(f"  {label}", val, val_ant)
+
+    _row_item("Total Gastos de administración", gastos_admin, gastos_admin_ant, note=True)
+
+    # --- Gastos de venta (52) - desglosado ---
     gastos_venta = _get_val("52")
     gastos_venta_ant = _get_val_ant("52")
-    _row_item("Gastos de Venta", gastos_venta, gastos_venta_ant)
+
+    sub_52 = _aggregate_gastos_4dig(df_er, "52")
+    sub_52_ant = _aggregate_gastos_4dig(df_er_anterior, "52") if df_er_anterior is not None else pd.DataFrame()
+
+    all_codes_52 = sorted(set(
+        sub_52["CODE_4"].tolist() +
+        (sub_52_ant["CODE_4"].tolist() if not sub_52_ant.empty else [])
+    ))
+
+    for code4 in all_codes_52:
+        label = GASTOS_4DIG_NAMES.get(code4, "Otros gastos")
+        val = sub_52.loc[sub_52["CODE_4"] == code4, "VALOR"].sum() if not sub_52.empty else 0
+        val_ant = sub_52_ant.loc[sub_52_ant["CODE_4"] == code4, "VALOR"].sum() if not sub_52_ant.empty else 0
+        if val == 0 and val_ant == 0:
+            continue
+        _row_item(f"  {label}", val, val_ant)
+
+    _row_item("Total Gastos de Venta", gastos_venta, gastos_venta_ant)
 
     # UTILIDAD OPERACIONAL
     util_oper = util_bruta - gastos_admin - gastos_venta

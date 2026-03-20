@@ -191,8 +191,11 @@ def calcular_valor_cuenta(row: pd.Series) -> float:
     debito = row.get("Movimiento débito", 0) or 0
     credito = row.get("Movimiento crédito", 0) or 0
     
-    if primer_digito in ["1", "2", "3", "8", "9"]:
-        # Cuentas de Balance y Orden: usar Saldo Final
+    if primer_digito in ["2", "3"]:
+        # Pasivos y Patrimonio: invertir signo para mostrar valores positivos
+        return -saldo_final
+    elif primer_digito in ["1", "8", "9"]:
+        # Activos y Cuentas de Orden: usar Saldo Final
         return saldo_final
     elif primer_digito == "4":
         # Ingresos: Crédito - Débito (ingresos se registran en el crédito)
