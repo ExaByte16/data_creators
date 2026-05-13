@@ -279,6 +279,22 @@ def normalize_datax_to_siigo(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def ensure_optional_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Algunos exports de SIIGO no traen todas las columnas del notebook original.
+
+    El pipeline las descarta igual al procesar (`Sucursal`, etc.), pero debe
+    existir la llave para no fallar validación ni `drop`. Se rellena en blanco.
+    """
+    df = df.copy()
+    if "Sucursal" not in df.columns:
+        df["Sucursal"] = ""
+    if "Identificación" not in df.columns:
+        df["Identificación"] = ""
+    if "Nombre tercero" not in df.columns:
+        df["Nombre tercero"] = ""
+    return df
+
+
 def validate_required_columns(df: pd.DataFrame) -> None:
     """Ensure the DataFrame contains required columns used by the notebook."""
     required_columns = {
@@ -297,14 +313,6 @@ def validate_required_columns(df: pd.DataFrame) -> None:
         raise ValueError(
             f"Faltan columnas requeridas en el archivo Excel: {', '.join(missing)}"
         )
-
-
-def ensure_nombre_tercero(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure column 'Nombre tercero' exists; if not, create it empty to match notebook usage."""
-    if "Nombre tercero" not in df.columns:
-        df = df.copy()
-        df["Nombre tercero"] = ""
-    return df
 
 
 def create_excel_download_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
@@ -736,9 +744,9 @@ def main() -> None:
             st.subheader("Vista previa (primeras filas)")
             st.dataframe(raw_df.head())
 
-            # Validar columnas y garantizar 'Nombre tercero'
+            # SIIGO a veces omite columnas opcionales; validar después de completarlas
+            raw_df = ensure_optional_columns(raw_df)
             validate_required_columns(raw_df)
-            raw_df = ensure_nombre_tercero(raw_df)
 
             # Procesar el DataFrame (lógica del notebook)
             (
@@ -794,7 +802,7 @@ def main() -> None:
                         else:
                             raw_df_ant = read_datax_excel(uploaded_file_anterior)
                             raw_df_ant = normalize_datax_to_siigo(raw_df_ant)
-                        raw_df_ant = ensure_nombre_tercero(raw_df_ant)
+                        raw_df_ant = ensure_optional_columns(raw_df_ant)
                         mes_ant = mes_anterior or mes
                         anio_ant = anio_anterior or anio
                         (df_balance_ant, df_er_ant, *_) = process_dataframe(

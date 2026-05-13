@@ -177,6 +177,41 @@ def _money(v):
     return float(v)
 
 
+def _sum_selected_rows(column: str, rows: list[int]) -> str:
+    """Excel SUM over selected rows, avoiding hidden detail double-counting."""
+    if not rows:
+        return "0"
+    return "=SUM(" + ",".join(f"{column}{row}" for row in rows) + ")"
+
+
+def _value_variation_formula(row: int) -> str:
+    """Excel formula for current minus previous period."""
+    return f"=D{row}-F{row}"
+
+
+def _pct_variation_formula(row: int) -> str:
+    """Excel formula for variation percentage, guarded for zero previous value."""
+    return f"=IF(F{row}=0,0,H{row}/ABS(F{row}))"
+
+
+def _apply_variation_formulas(ws, row: int) -> None:
+    """Write formulas for variation columns H and I in EF/ER rows."""
+    ws.cell(row=row, column=8).value = _value_variation_formula(row)
+    ws.cell(row=row, column=9).value = _pct_variation_formula(row)
+
+
+def _apply_percentage_formulas(
+    ws,
+    rows: list[int],
+    current_base_cell: str,
+    previous_base_cell: str,
+) -> None:
+    """Write formulas for % current and % previous in EF/ER rows."""
+    for row in rows:
+        ws.cell(row=row, column=5).value = f"=IF({current_base_cell}=0,0,D{row}/ABS({current_base_cell}))"
+        ws.cell(row=row, column=7).value = f"=IF({previous_base_cell}=0,0,F{row}/ABS({previous_base_cell}))"
+
+
 # ---------------------------------------------------------------------------
 # Branding
 # ---------------------------------------------------------------------------
@@ -263,7 +298,9 @@ def _get_detail_for_subgrupo(df, sg_code):
 
 def _write_ef_detail_rows(ws, row, detail, detail_ant_map, total_base, total_base_ant,
                           base_level=1):
-    """Write cuenta + tercero detail rows with outline for EF sheet. Returns next row."""
+    """Write cuenta + tercero detail rows with outline for EF sheet."""
+    account_rows = []
+    calc_rows = []
     for cuenta_key, cuenta_val, terceros in detail:
         cuenta_code = cuenta_key.split(" - ")[0].strip() if " - " in cuenta_key else ""
         cuenta_name = cuenta_key.split(" - ")[1].strip() if " - " in cuenta_key else cuenta_key
@@ -271,14 +308,13 @@ def _write_ef_detail_rows(ws, row, detail, detail_ant_map, total_base, total_bas
         # Get anterior value for this cuenta
         ant_info = detail_ant_map.get(cuenta_key, (0, []))
         val_ant = ant_info[0]
-        var_val = cuenta_val - val_ant
-        pct_act = cuenta_val / total_base if total_base else 0
-        pct_ant = val_ant / total_base_ant if total_base_ant else 0
-        var_pct = (var_val / abs(val_ant)) if val_ant != 0 else 0
 
         # Write cuenta row
+        account_row = row
+        account_rows.append(account_row)
+        calc_rows.append(account_row)
         _ef_data_row(ws, row, f"  {cuenta_code}", f"  {cuenta_name}", "",
-                     cuenta_val, pct_act, val_ant, pct_ant, var_val, var_pct, filtro=True)
+                     cuenta_val, "", val_ant, "", "", "", filtro=True)
         # Override font to FONT_BODY (normal, not bold)
         for c in range(1, 10):
             ws.cell(row=row, column=c).font = FONT_BODY
@@ -288,22 +324,27 @@ def _write_ef_detail_rows(ws, row, detail, detail_ant_map, total_base, total_bas
 
         # Terceros
         ant_terceros = {t[0]: t[1] for t in ant_info[1]} if len(ant_info) > 1 else {}
+        detail_start_row = row
         for tercero_name, tercero_val in terceros:
             t_val_ant = ant_terceros.get(tercero_name, 0)
-            t_var = tercero_val - t_val_ant
-            t_pct_act = tercero_val / total_base if total_base else 0
-            t_pct_ant = t_val_ant / total_base_ant if total_base_ant else 0
-            t_var_pct = (t_var / abs(t_val_ant)) if t_val_ant != 0 else 0
 
             _ef_data_row(ws, row, "", f"    {tercero_name}", "",
-                         tercero_val, t_pct_act, t_val_ant, t_pct_ant, t_var, t_var_pct, filtro=True)
+                         tercero_val, "", t_val_ant, "", "", "", filtro=True)
+            _apply_variation_formulas(ws, row)
+            calc_rows.append(row)
             for c in range(1, 10):
                 ws.cell(row=row, column=c).font = FONT_DETAIL
             ws.row_dimensions[row].outline_level = base_level + 1
             ws.row_dimensions[row].hidden = True
             row += 1
 
-    return row
+        detail_end_row = row - 1
+        if detail_start_row <= detail_end_row:
+            ws.cell(row=account_row, column=4).value = f"=SUM(D{detail_start_row}:D{detail_end_row})"
+            ws.cell(row=account_row, column=6).value = f"=SUM(F{detail_start_row}:F{detail_end_row})"
+        _apply_variation_formulas(ws, account_row)
+
+    return row, account_rows, calc_rows
 
 
 def _build_detail_ant_map(df_ant, sg_code):
@@ -330,9 +371,11 @@ def _build_detail_ant_map(df_ant, sg_code):
 
 def _write_er_detail_rows(ws, row, df_er, df_er_ant, sg_code, total_ingresos, total_ingresos_ant,
                           base_level=1):
-    """Write cuenta + tercero detail rows for an ER subgrupo. Returns next row."""
+    """Write cuenta + tercero detail rows for an ER subgrupo."""
     detail = _get_detail_for_subgrupo(df_er, sg_code)
     detail_ant_map = _build_detail_ant_map(df_er_ant, sg_code)
+    account_rows = []
+    calc_rows = []
 
     for cuenta_key, cuenta_val, terceros in detail:
         cuenta_code = cuenta_key.split(" - ")[0].strip() if " - " in cuenta_key else ""
@@ -340,23 +383,21 @@ def _write_er_detail_rows(ws, row, df_er, df_er_ant, sg_code, total_ingresos, to
 
         ant_info = detail_ant_map.get(cuenta_key, (0, []))
         val_ant = ant_info[0]
-        var_val = cuenta_val - val_ant
-
-        pct_act = cuenta_val / total_ingresos if total_ingresos else 0
-        pct_ant = val_ant / total_ingresos_ant if total_ingresos_ant else 0
-        var_pct = (var_val / abs(val_ant)) if val_ant != 0 else 0
 
         indent = "  " * base_level
+        account_row = row
+        account_rows.append(account_row)
+        calc_rows.append(account_row)
         c = 1
         _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER); c += 1
         _wc(ws, row, c, f"{indent}{cuenta_code} - {cuenta_name}", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_LEFT); c += 1
         _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_CENTER); c += 1
         _wc(ws, row, c, cuenta_val, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-        _wc(ws, row, c, pct_act, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
         _wc(ws, row, c, val_ant, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-        _wc(ws, row, c, pct_ant, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
-        _wc(ws, row, c, var_val, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-        _wc(ws, row, c, var_pct, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
         _wc(ws, row, c, "TRUE", font=FONT_FILTRO)
         ws.row_dimensions[row].outline_level = base_level
         ws.row_dimensions[row].hidden = True
@@ -364,12 +405,9 @@ def _write_er_detail_rows(ws, row, df_er, df_er_ant, sg_code, total_ingresos, to
 
         # Terceros
         ant_terceros = {t[0]: t[1] for t in ant_info[1]} if len(ant_info) > 1 else {}
+        detail_start_row = row
         for tercero_name, tercero_val in terceros:
             t_val_ant = ant_terceros.get(tercero_name, 0)
-            t_var = tercero_val - t_val_ant
-            t_pct_act = tercero_val / total_ingresos if total_ingresos else 0
-            t_pct_ant = t_val_ant / total_ingresos_ant if total_ingresos_ant else 0
-            t_var_pct = (t_var / abs(t_val_ant)) if t_val_ant != 0 else 0
 
             indent2 = "  " * (base_level + 1)
             c = 1
@@ -377,17 +415,25 @@ def _write_er_detail_rows(ws, row, df_er, df_er_ant, sg_code, total_ingresos, to
             _wc(ws, row, c, f"{indent2}{tercero_name}", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_LEFT); c += 1
             _wc(ws, row, c, "", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_CENTER); c += 1
             _wc(ws, row, c, tercero_val, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-            _wc(ws, row, c, t_pct_act, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, "", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
             _wc(ws, row, c, t_val_ant, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-            _wc(ws, row, c, t_pct_ant, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
-            _wc(ws, row, c, t_var, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-            _wc(ws, row, c, t_var_pct, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, "", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, "", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+            _wc(ws, row, c, "", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
             _wc(ws, row, c, "TRUE", font=FONT_FILTRO)
+            _apply_variation_formulas(ws, row)
+            calc_rows.append(row)
             ws.row_dimensions[row].outline_level = base_level + 1
             ws.row_dimensions[row].hidden = True
             row += 1
 
-    return row
+        detail_end_row = row - 1
+        if detail_start_row <= detail_end_row:
+            ws.cell(row=account_row, column=4).value = f"=SUM(D{detail_start_row}:D{detail_end_row})"
+            ws.cell(row=account_row, column=6).value = f"=SUM(F{detail_start_row}:F{detail_end_row})"
+        _apply_variation_formulas(ws, account_row)
+
+    return row, account_rows, calc_rows
 
 
 def _get_detail_for_4dig(df, code4):
@@ -439,6 +485,8 @@ def _write_er_4dig_detail_rows(ws, row, df_er, df_er_ant, code4,
     """Write cuenta + tercero detail rows for a 4-digit gastos category."""
     detail = _get_detail_for_4dig(df_er, code4)
     detail_ant_map = _build_detail_ant_map_4dig(df_er_ant, code4)
+    account_rows = []
+    calc_rows = []
 
     for cuenta_key, cuenta_val, terceros in detail:
         cuenta_code = cuenta_key.split(" - ")[0].strip() if " - " in cuenta_key else ""
@@ -446,22 +494,21 @@ def _write_er_4dig_detail_rows(ws, row, df_er, df_er_ant, code4,
 
         ant_info = detail_ant_map.get(cuenta_key, (0, []))
         val_ant = ant_info[0]
-        var_val = cuenta_val - val_ant
-        pct_act = cuenta_val / total_ingresos if total_ingresos else 0
-        pct_ant = val_ant / total_ingresos_ant if total_ingresos_ant else 0
-        var_pct = (var_val / abs(val_ant)) if val_ant != 0 else 0
 
         indent = "  " * base_level
+        account_row = row
+        account_rows.append(account_row)
+        calc_rows.append(account_row)
         c = 1
         _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER); c += 1
         _wc(ws, row, c, f"{indent}{cuenta_code} - {cuenta_name}", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_LEFT); c += 1
         _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_CENTER); c += 1
         _wc(ws, row, c, cuenta_val, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-        _wc(ws, row, c, pct_act, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
         _wc(ws, row, c, val_ant, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-        _wc(ws, row, c, pct_ant, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
-        _wc(ws, row, c, var_val, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-        _wc(ws, row, c, var_pct, font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
         _wc(ws, row, c, "TRUE", font=FONT_FILTRO)
         ws.row_dimensions[row].outline_level = base_level
         ws.row_dimensions[row].hidden = True
@@ -469,12 +516,9 @@ def _write_er_4dig_detail_rows(ws, row, df_er, df_er_ant, code4,
 
         # Terceros
         ant_terceros = {t[0]: t[1] for t in ant_info[1]} if len(ant_info) > 1 else {}
+        detail_start_row = row
         for tercero_name, tercero_val in terceros:
             t_val_ant = ant_terceros.get(tercero_name, 0)
-            t_var = tercero_val - t_val_ant
-            t_pct_act = tercero_val / total_ingresos if total_ingresos else 0
-            t_pct_ant = t_val_ant / total_ingresos_ant if total_ingresos_ant else 0
-            t_var_pct = (t_var / abs(t_val_ant)) if t_val_ant != 0 else 0
 
             indent2 = "  " * (base_level + 1)
             c = 1
@@ -482,17 +526,25 @@ def _write_er_4dig_detail_rows(ws, row, df_er, df_er_ant, code4,
             _wc(ws, row, c, f"{indent2}{tercero_name}", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_LEFT); c += 1
             _wc(ws, row, c, "", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_CENTER); c += 1
             _wc(ws, row, c, tercero_val, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-            _wc(ws, row, c, t_pct_act, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, "", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
             _wc(ws, row, c, t_val_ant, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-            _wc(ws, row, c, t_pct_ant, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
-            _wc(ws, row, c, t_var, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-            _wc(ws, row, c, t_var_pct, font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, "", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, "", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+            _wc(ws, row, c, "", font=FONT_DETAIL, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
             _wc(ws, row, c, "TRUE", font=FONT_FILTRO)
+            _apply_variation_formulas(ws, row)
+            calc_rows.append(row)
             ws.row_dimensions[row].outline_level = base_level + 1
             ws.row_dimensions[row].hidden = True
             row += 1
 
-    return row
+        detail_end_row = row - 1
+        if detail_start_row <= detail_end_row:
+            ws.cell(row=account_row, column=4).value = f"=SUM(D{detail_start_row}:D{detail_end_row})"
+            ws.cell(row=account_row, column=6).value = f"=SUM(F{detail_start_row}:F{detail_end_row})"
+        _apply_variation_formulas(ws, account_row)
+
+    return row, account_rows, calc_rows
 
 
 # ---------------------------------------------------------------------------
@@ -668,13 +720,14 @@ def _build_ef_sheet(wb, df_balance, branding, periodo_actual, periodo_anterior=N
     ]
 
     grand_totals = {}
+    calc_rows = []
+    active_total_row = None
 
     for clase_label, groups in sections_ef:
         if clase_label == "PASIVO":
             row += 1  # blank before PASIVO
 
-        clase_total_val = 0
-        clase_total_ant = 0
+        clase_total_rows = []
 
         for section_title, grupo_name, subgrupo_codes in groups:
             # Section header (e.g., "CORRIENTE", "NO CORRIENTE")
@@ -682,8 +735,7 @@ def _build_ef_sheet(wb, df_balance, branding, periodo_actual, periodo_anterior=N
                          is_section_header=True, filtro=True)
             row += 1
 
-            section_val = 0
-            section_ant = 0
+            section_rows = []
 
             for sg_code in subgrupo_codes:
                 sg_data = agg[agg["SUBGRUPO_COD"] == sg_code]
@@ -697,13 +749,6 @@ def _build_ef_sheet(wb, df_balance, branding, periodo_actual, periodo_anterior=N
                 if val == 0 and val_ant == 0:
                     continue
 
-                section_val += val
-                section_ant += val_ant
-                var_val = val - val_ant
-                pct_act = val / total_activo if total_activo else 0
-                pct_ant_v = val_ant / total_activo_ant if total_activo_ant else 0
-                var_pct = (var_val / abs(val_ant)) if val_ant != 0 else 0
-
                 niif_name = NIIF_NAMES.get(sg_code, sg_code)
                 suffix = SUBGRUPO_SUFFIX.get(sg_code, "")
                 display_code = f"{sg_code} {sg_code}{suffix}"
@@ -711,58 +756,75 @@ def _build_ef_sheet(wb, df_balance, branding, periodo_actual, periodo_anterior=N
                 note_val = nota_num
                 nota_num += 1
 
+                subgrupo_row = row
+                section_rows.append(subgrupo_row)
+                calc_rows.append(subgrupo_row)
                 _ef_data_row(ws, row, display_code, niif_name, note_val,
-                             val, pct_act, val_ant, pct_ant_v, var_val, var_pct, filtro=True)
+                             val, "", val_ant, "", "", "", filtro=True)
                 row += 1
 
                 # Detail: cuentas + terceros (collapsed)
                 detail = _get_detail_for_subgrupo(df_balance, sg_code)
                 detail_ant_map = _build_detail_ant_map(df_balance_anterior, sg_code)
-                row = _write_ef_detail_rows(
+                row, detail_account_rows, detail_calc_rows = _write_ef_detail_rows(
                     ws, row, detail, detail_ant_map,
                     total_activo, total_activo_ant, base_level=1
                 )
+                calc_rows.extend(detail_calc_rows)
+                if detail_account_rows:
+                    ws.cell(row=subgrupo_row, column=4).value = _sum_selected_rows("D", detail_account_rows)
+                    ws.cell(row=subgrupo_row, column=6).value = _sum_selected_rows("F", detail_account_rows)
+                _apply_variation_formulas(ws, subgrupo_row)
 
             # Section total
-            var_sec = section_val - section_ant
-            pct_sec = section_val / total_activo if total_activo else 0
-            pct_sec_ant = section_ant / total_activo_ant if total_activo_ant else 0
-            var_pct_sec = (var_sec / abs(section_ant)) if section_ant != 0 else 0
-
+            section_total_row = row
+            clase_total_rows.append(section_total_row)
+            calc_rows.append(section_total_row)
             _ef_data_row(ws, row, "", f"TOTAL {section_title}", "",
-                         section_val, pct_sec, section_ant, pct_sec_ant, var_sec, var_pct_sec,
+                         _sum_selected_rows("D", section_rows), "",
+                         _sum_selected_rows("F", section_rows), "", "", "",
                          is_total=True, filtro=True)
+            _apply_variation_formulas(ws, row)
             row += 1
 
-            clase_total_val += section_val
-            clase_total_ant += section_ant
-
         # Grand total for clase (TOTAL ACTIVO, TOTAL PASIVO, TOTAL PATRIMONIO)
-        var_clase = clase_total_val - clase_total_ant
-        pct_clase = clase_total_val / total_activo if total_activo else 0
-        pct_clase_ant = clase_total_ant / total_activo_ant if total_activo_ant else 0
-        var_pct_clase = (var_clase / abs(clase_total_ant)) if clase_total_ant != 0 else 0
-
+        clase_total_row = row
+        calc_rows.append(clase_total_row)
         _ef_data_row(ws, row, "", f"TOTAL {clase_label}", "",
-                     clase_total_val, pct_clase, clase_total_ant, pct_clase_ant, var_clase, var_pct_clase,
+                     _sum_selected_rows("D", clase_total_rows), "",
+                     _sum_selected_rows("F", clase_total_rows), "", "", "",
                      is_grand_total=True, filtro=True)
+        _apply_variation_formulas(ws, row)
+        if clase_label == "ACTIVO":
+            active_total_row = clase_total_row
         row += 1
 
-        grand_totals[clase_label] = (clase_total_val, clase_total_ant)
+        grand_totals[clase_label] = clase_total_row
 
     # TOTAL PASIVO Y PATRIMONIO
     row += 1
-    pasivo_val = grand_totals.get("PASIVO", (0, 0))[0] + grand_totals.get("PATRIMONIO", (0, 0))[0]
-    pasivo_ant = grand_totals.get("PASIVO", (0, 0))[1] + grand_totals.get("PATRIMONIO", (0, 0))[1]
-    var_pp = pasivo_val - pasivo_ant
-    pct_pp = pasivo_val / total_activo if total_activo else 0
-    pct_pp_ant = pasivo_ant / total_activo_ant if total_activo_ant else 0
-    var_pct_pp = (var_pp / abs(pasivo_ant)) if pasivo_ant != 0 else 0
-
+    pasivo_patrimonio_rows = [
+        total_row for total_row in [
+            grand_totals.get("PASIVO"),
+            grand_totals.get("PATRIMONIO"),
+        ]
+        if total_row
+    ]
+    calc_rows.append(row)
     _ef_data_row(ws, row, "", "TOTAL PASIVO Y PATRIMONIO", "",
-                 pasivo_val, pct_pp, pasivo_ant, pct_pp_ant, var_pp, var_pct_pp,
+                 _sum_selected_rows("D", pasivo_patrimonio_rows), "",
+                 _sum_selected_rows("F", pasivo_patrimonio_rows), "", "", "",
                  is_grand_total=True, filtro=True)
+    _apply_variation_formulas(ws, row)
     row += 2
+
+    if active_total_row:
+        _apply_percentage_formulas(
+            ws,
+            calc_rows,
+            current_base_cell=f"$D${active_total_row}",
+            previous_base_cell=f"$F${active_total_row}",
+        )
 
     _write_signatures(ws, branding, row)
 
@@ -824,23 +886,23 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
         return (val - val_ant) / abs(val_ant) if val_ant != 0 else 0
 
     nota = nota_start
+    calc_rows = []
+    ingresos_row = None
 
     def _row_item(label, val, val_ant, note=None, bold=False, grand=False, total_bg=False):
         nonlocal row, nota
-        var = val - val_ant
+        written_row = row
         n = None
         if note:
             n = nota
             nota += 1
 
         if grand:
-            _ef_data_row(ws, row, "", label, n, val, _pct(val, total_ingresos),
-                         val_ant, _pct(val_ant, total_ingresos_ant),
-                         var, _var_pct(val, val_ant), is_grand_total=True)
+            _ef_data_row(ws, row, "", label, n, val, "",
+                         val_ant, "", "", "", is_grand_total=True)
         elif total_bg:
-            _ef_data_row(ws, row, "", label, n, val, _pct(val, total_ingresos),
-                         val_ant, _pct(val_ant, total_ingresos_ant),
-                         var, _var_pct(val, val_ant), is_total=True)
+            _ef_data_row(ws, row, "", label, n, val, "",
+                         val_ant, "", "", "", is_total=True)
         else:
             font = FONT_BODY_BOLD if bold else FONT_BODY
             c = 1
@@ -848,37 +910,59 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
             _wc(ws, row, c, label, font=font, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_LEFT); c += 1
             _wc(ws, row, c, n if n else "", font=font, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_CENTER); c += 1
             _wc(ws, row, c, val, font=font, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-            _wc(ws, row, c, _pct(val, total_ingresos), font=font, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, "", font=font, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
             _wc(ws, row, c, val_ant, font=font, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-            _wc(ws, row, c, _pct(val_ant, total_ingresos_ant), font=font, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
-            _wc(ws, row, c, var, font=font, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
-            _wc(ws, row, c, _var_pct(val, val_ant), font=font, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, "", font=font, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+            _wc(ws, row, c, "", font=font, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+            _wc(ws, row, c, "", font=font, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
             _wc(ws, row, c, "TRUE", font=FONT_FILTRO)
 
+        _apply_variation_formulas(ws, written_row)
         row += 1
+        calc_rows.append(written_row)
+        return written_row
 
     # --- P&L Waterfall ---
 
     # Ventas (41)
-    _row_item("Venta de producto y prestación de servicios", ingresos_41, ingresos_41_ant, note=True)
+    ingresos_row = _row_item("Venta de producto y prestación de servicios", ingresos_41, ingresos_41_ant, note=True)
     # Detail for 41 (level 1 = cuenta, level 2 = tercero)
-    row = _write_er_detail_rows(ws, row, df_er, df_er_anterior, "41",
-                                total_ingresos, total_ingresos_ant, base_level=1)
+    row, ingresos_account_rows, ingresos_calc_rows = _write_er_detail_rows(
+        ws, row, df_er, df_er_anterior, "41",
+        total_ingresos, total_ingresos_ant, base_level=1
+    )
+    calc_rows.extend(ingresos_calc_rows)
+    if ingresos_account_rows:
+        ws.cell(row=ingresos_row, column=4).value = _sum_selected_rows("D", ingresos_account_rows)
+        ws.cell(row=ingresos_row, column=6).value = _sum_selected_rows("F", ingresos_account_rows)
+        _apply_variation_formulas(ws, ingresos_row)
 
     # Costos de ventas (61, 62, 71-74)
     costo_codes = ["61", "62", "71", "72", "73", "74"]
     costos = sum(_get_val(c) for c in costo_codes)
     costos_ant = sum(_get_val_ant(c) for c in costo_codes)
-    _row_item("MENOS:  COSTO DE VENTAS", costos, costos_ant)
+    costos_row = _row_item("MENOS:  COSTO DE VENTAS", costos, costos_ant)
     # Detail for each costo code
+    costo_account_rows = []
     for costo_sg in costo_codes:
-        row = _write_er_detail_rows(ws, row, df_er, df_er_anterior, costo_sg,
-                                    total_ingresos, total_ingresos_ant, base_level=1)
+        row, account_rows, detail_calc_rows = _write_er_detail_rows(
+            ws, row, df_er, df_er_anterior, costo_sg,
+            total_ingresos, total_ingresos_ant, base_level=1
+        )
+        costo_account_rows.extend(account_rows)
+        calc_rows.extend(detail_calc_rows)
+    if costo_account_rows:
+        ws.cell(row=costos_row, column=4).value = _sum_selected_rows("D", costo_account_rows)
+        ws.cell(row=costos_row, column=6).value = _sum_selected_rows("F", costo_account_rows)
+        _apply_variation_formulas(ws, costos_row)
 
     # UTILIDAD BRUTA
     util_bruta = ingresos_41 - costos
     util_bruta_ant = ingresos_41_ant - costos_ant
-    _row_item("UTILIDAD BRUTA", util_bruta, util_bruta_ant, total_bg=True)
+    util_bruta_row = _row_item("UTILIDAD BRUTA", util_bruta, util_bruta_ant, total_bg=True)
+    ws.cell(row=util_bruta_row, column=4).value = f"=D{ingresos_row}-D{costos_row}"
+    ws.cell(row=util_bruta_row, column=6).value = f"=F{ingresos_row}-F{costos_row}"
+    _apply_variation_formulas(ws, util_bruta_row)
 
     # --- Gastos de administración (51) - desglosado ---
     gastos_admin = _get_val("51")
@@ -892,21 +976,34 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
         (sub_51_ant["CODE_4"].tolist() if not sub_51_ant.empty else [])
     ))
 
+    admin_rows = []
     for code4 in all_codes_51:
         label = GASTOS_4DIG_NAMES.get(code4, "Otros gastos")
         val = sub_51.loc[sub_51["CODE_4"] == code4, "VALOR"].sum() if not sub_51.empty else 0
         val_ant = sub_51_ant.loc[sub_51_ant["CODE_4"] == code4, "VALOR"].sum() if not sub_51_ant.empty else 0
         if val == 0 and val_ant == 0:
             continue
-        _row_item(f"  {label}", val, val_ant)
+        code4_row = _row_item(f"  {label}", val, val_ant)
+        admin_rows.append(code4_row)
         # Mark 4-digit row as outline_level=1
         ws.row_dimensions[row - 1].outline_level = 1
         ws.row_dimensions[row - 1].hidden = True
         # Detail: cuentas + terceros within this 4-digit category
-        row = _write_er_4dig_detail_rows(ws, row, df_er, df_er_anterior, code4,
-                                          total_ingresos, total_ingresos_ant, base_level=2)
+        row, account_rows, detail_calc_rows = _write_er_4dig_detail_rows(
+            ws, row, df_er, df_er_anterior, code4,
+            total_ingresos, total_ingresos_ant, base_level=2
+        )
+        if account_rows:
+            ws.cell(row=code4_row, column=4).value = _sum_selected_rows("D", account_rows)
+            ws.cell(row=code4_row, column=6).value = _sum_selected_rows("F", account_rows)
+            _apply_variation_formulas(ws, code4_row)
+        calc_rows.extend(detail_calc_rows)
 
-    _row_item("Total Gastos de administración", gastos_admin, gastos_admin_ant, note=True)
+    gastos_admin_row = _row_item("Total Gastos de administración", gastos_admin, gastos_admin_ant, note=True)
+    if admin_rows:
+        ws.cell(row=gastos_admin_row, column=4).value = _sum_selected_rows("D", admin_rows)
+        ws.cell(row=gastos_admin_row, column=6).value = _sum_selected_rows("F", admin_rows)
+        _apply_variation_formulas(ws, gastos_admin_row)
 
     # --- Gastos de venta (52) - desglosado ---
     gastos_venta = _get_val("52")
@@ -920,57 +1017,108 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
         (sub_52_ant["CODE_4"].tolist() if not sub_52_ant.empty else [])
     ))
 
+    venta_rows = []
     for code4 in all_codes_52:
         label = GASTOS_4DIG_NAMES.get(code4, "Otros gastos")
         val = sub_52.loc[sub_52["CODE_4"] == code4, "VALOR"].sum() if not sub_52.empty else 0
         val_ant = sub_52_ant.loc[sub_52_ant["CODE_4"] == code4, "VALOR"].sum() if not sub_52_ant.empty else 0
         if val == 0 and val_ant == 0:
             continue
-        _row_item(f"  {label}", val, val_ant)
+        code4_row = _row_item(f"  {label}", val, val_ant)
+        venta_rows.append(code4_row)
         # Mark 4-digit row as outline_level=1
         ws.row_dimensions[row - 1].outline_level = 1
         ws.row_dimensions[row - 1].hidden = True
         # Detail: cuentas + terceros within this 4-digit category
-        row = _write_er_4dig_detail_rows(ws, row, df_er, df_er_anterior, code4,
-                                          total_ingresos, total_ingresos_ant, base_level=2)
+        row, account_rows, detail_calc_rows = _write_er_4dig_detail_rows(
+            ws, row, df_er, df_er_anterior, code4,
+            total_ingresos, total_ingresos_ant, base_level=2
+        )
+        if account_rows:
+            ws.cell(row=code4_row, column=4).value = _sum_selected_rows("D", account_rows)
+            ws.cell(row=code4_row, column=6).value = _sum_selected_rows("F", account_rows)
+            _apply_variation_formulas(ws, code4_row)
+        calc_rows.extend(detail_calc_rows)
 
-    _row_item("Total Gastos de Venta", gastos_venta, gastos_venta_ant)
+    gastos_venta_row = _row_item("Total Gastos de Venta", gastos_venta, gastos_venta_ant)
+    if venta_rows:
+        ws.cell(row=gastos_venta_row, column=4).value = _sum_selected_rows("D", venta_rows)
+        ws.cell(row=gastos_venta_row, column=6).value = _sum_selected_rows("F", venta_rows)
+        _apply_variation_formulas(ws, gastos_venta_row)
 
     # UTILIDAD OPERACIONAL
     util_oper = util_bruta - gastos_admin - gastos_venta
     util_oper_ant = util_bruta_ant - gastos_admin_ant - gastos_venta_ant
-    _row_item("UTILIDAD OPERACIONAL", util_oper, util_oper_ant, grand=True)
+    util_oper_row = _row_item("UTILIDAD OPERACIONAL", util_oper, util_oper_ant, grand=True)
+    ws.cell(row=util_oper_row, column=4).value = f"=D{util_bruta_row}-D{gastos_admin_row}-D{gastos_venta_row}"
+    ws.cell(row=util_oper_row, column=6).value = f"=F{util_bruta_row}-F{gastos_admin_row}-F{gastos_venta_row}"
+    _apply_variation_formulas(ws, util_oper_row)
 
     # Ingresos no ordinarios (42)
     ing_no_ord = _get_val("42")
     ing_no_ord_ant = _get_val_ant("42")
-    _row_item("Ingresos no ordinarios", ing_no_ord, ing_no_ord_ant, note=True)
-    row = _write_er_detail_rows(ws, row, df_er, df_er_anterior, "42",
-                                total_ingresos, total_ingresos_ant, base_level=1)
+    ing_no_ord_row = _row_item("Ingresos no ordinarios", ing_no_ord, ing_no_ord_ant, note=True)
+    row, account_rows, detail_calc_rows = _write_er_detail_rows(
+        ws, row, df_er, df_er_anterior, "42",
+        total_ingresos, total_ingresos_ant, base_level=1
+    )
+    if account_rows:
+        ws.cell(row=ing_no_ord_row, column=4).value = _sum_selected_rows("D", account_rows)
+        ws.cell(row=ing_no_ord_row, column=6).value = _sum_selected_rows("F", account_rows)
+        _apply_variation_formulas(ws, ing_no_ord_row)
+    calc_rows.extend(detail_calc_rows)
 
     # Gastos no ordinarios (53)
     gtos_no_ord = _get_val("53")
     gtos_no_ord_ant = _get_val_ant("53")
-    _row_item("Gastos no ordinarios", gtos_no_ord, gtos_no_ord_ant, note=True)
-    row = _write_er_detail_rows(ws, row, df_er, df_er_anterior, "53",
-                                total_ingresos, total_ingresos_ant, base_level=1)
+    gtos_no_ord_row = _row_item("Gastos no ordinarios", gtos_no_ord, gtos_no_ord_ant, note=True)
+    row, account_rows, detail_calc_rows = _write_er_detail_rows(
+        ws, row, df_er, df_er_anterior, "53",
+        total_ingresos, total_ingresos_ant, base_level=1
+    )
+    if account_rows:
+        ws.cell(row=gtos_no_ord_row, column=4).value = _sum_selected_rows("D", account_rows)
+        ws.cell(row=gtos_no_ord_row, column=6).value = _sum_selected_rows("F", account_rows)
+        _apply_variation_formulas(ws, gtos_no_ord_row)
+    calc_rows.extend(detail_calc_rows)
 
     # UTILIDAD (PERDIDA) ANTES DE IMPUESTOS
     util_antes_imp = util_oper + ing_no_ord - gtos_no_ord
     util_antes_imp_ant = util_oper_ant + ing_no_ord_ant - gtos_no_ord_ant
-    _row_item("UTILIDAD (PERDIDA) ANTES DE IMPUESTOS", util_antes_imp, util_antes_imp_ant, grand=True)
+    util_antes_imp_row = _row_item("UTILIDAD (PERDIDA) ANTES DE IMPUESTOS", util_antes_imp, util_antes_imp_ant, grand=True)
+    ws.cell(row=util_antes_imp_row, column=4).value = f"=D{util_oper_row}+D{ing_no_ord_row}-D{gtos_no_ord_row}"
+    ws.cell(row=util_antes_imp_row, column=6).value = f"=F{util_oper_row}+F{ing_no_ord_row}-F{gtos_no_ord_row}"
+    _apply_variation_formulas(ws, util_antes_imp_row)
 
     # Provisión Impuesto de Renta (54)
     imp_renta = _get_val("54")
     imp_renta_ant = _get_val_ant("54")
-    _row_item("Provisión Impuesto de Renta", imp_renta, imp_renta_ant)
-    row = _write_er_detail_rows(ws, row, df_er, df_er_anterior, "54",
-                                total_ingresos, total_ingresos_ant, base_level=1)
+    imp_renta_row = _row_item("Provisión Impuesto de Renta", imp_renta, imp_renta_ant)
+    row, account_rows, detail_calc_rows = _write_er_detail_rows(
+        ws, row, df_er, df_er_anterior, "54",
+        total_ingresos, total_ingresos_ant, base_level=1
+    )
+    if account_rows:
+        ws.cell(row=imp_renta_row, column=4).value = _sum_selected_rows("D", account_rows)
+        ws.cell(row=imp_renta_row, column=6).value = _sum_selected_rows("F", account_rows)
+        _apply_variation_formulas(ws, imp_renta_row)
+    calc_rows.extend(detail_calc_rows)
 
     # UTILIDAD NETA
     util_neta = util_antes_imp - imp_renta
     util_neta_ant = util_antes_imp_ant - imp_renta_ant
-    _row_item("UTILIDAD NETA", util_neta, util_neta_ant, grand=True)
+    util_neta_row = _row_item("UTILIDAD NETA", util_neta, util_neta_ant, grand=True)
+    ws.cell(row=util_neta_row, column=4).value = f"=D{util_antes_imp_row}-D{imp_renta_row}"
+    ws.cell(row=util_neta_row, column=6).value = f"=F{util_antes_imp_row}-F{imp_renta_row}"
+    _apply_variation_formulas(ws, util_neta_row)
+
+    if ingresos_row:
+        _apply_percentage_formulas(
+            ws,
+            calc_rows,
+            current_base_cell=f"$D${ingresos_row}",
+            previous_base_cell=f"$F${ingresos_row}",
+        )
 
     row += 1
     _write_signatures(ws, branding, row)
@@ -983,76 +1131,240 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
 # ---------------------------------------------------------------------------
 # Notas
 # ---------------------------------------------------------------------------
-def _build_notas_sheet(wb, df_balance, df_er, branding, periodo_actual):
+def _prepare_notas_data(*dfs: pd.DataFrame | None) -> pd.DataFrame:
+    """Normalize report data for Notas: subgrupo, cuenta, tercero and valor."""
+    frames = [df for df in dfs if df is not None and not df.empty]
+    columns = ["SUBGRUPO_COD", "CUENTA", "CUENTA_COD", "CUENTA_NOMBRE", "TERCERO", "VALOR"]
+    if not frames:
+        return pd.DataFrame(columns=columns)
+
+    combined = pd.concat(frames, ignore_index=True).copy()
+    if "CUENTA" not in combined.columns or "VALOR" not in combined.columns:
+        return pd.DataFrame(columns=columns)
+
+    combined["CUENTA"] = combined["CUENTA"].fillna("").astype(str).str.strip()
+    combined = combined[combined["CUENTA"] != ""].copy()
+    if combined.empty:
+        return pd.DataFrame(columns=columns)
+
+    combined["VALOR"] = pd.to_numeric(combined["VALOR"], errors="coerce").fillna(0)
+    combined["CUENTA_COD"] = combined["CUENTA"].str.extract(r'^(\d+)')[0].fillna("")
+    combined["SUBGRUPO_COD"] = combined["CUENTA_COD"].str[:2]
+
+    cuenta_parts = combined["CUENTA"].str.split(" - ", n=1, expand=True)
+    if cuenta_parts.shape[1] > 1:
+        combined["CUENTA_NOMBRE"] = cuenta_parts[1].fillna(combined["CUENTA"])
+    else:
+        combined["CUENTA_NOMBRE"] = combined["CUENTA"]
+    combined["CUENTA_NOMBRE"] = combined["CUENTA_NOMBRE"].astype(str).str.strip()
+
+    if "TERCERO" not in combined.columns:
+        combined["TERCERO"] = ""
+    combined["TERCERO"] = combined["TERCERO"].fillna("").astype(str).str.strip()
+
+    return combined[columns].copy()
+
+
+def _notas_account_totals(notes_df: pd.DataFrame, sg_code: str) -> dict[str, dict[str, Any]]:
+    """Build account-level totals for one note/subgrupo."""
+    if notes_df.empty:
+        return {}
+
+    sg_data = notes_df[notes_df["SUBGRUPO_COD"] == sg_code]
+    if sg_data.empty:
+        return {}
+
+    grouped = (
+        sg_data.groupby(["CUENTA", "CUENTA_COD", "CUENTA_NOMBRE"], as_index=False, dropna=False)
+        .agg(VALOR=("VALOR", "sum"))
+        .sort_values("CUENTA_COD")
+    )
+
+    return {
+        str(row["CUENTA"]): {
+            "codigo": str(row["CUENTA_COD"]),
+            "nombre": str(row["CUENTA_NOMBRE"]),
+            "valor": _money(row["VALOR"]),
+        }
+        for _, row in grouped.iterrows()
+    }
+
+
+def _notas_tercero_totals(notes_df: pd.DataFrame, sg_code: str, cuenta: str) -> dict[str, float]:
+    """Build third-party totals for one account inside one note/subgrupo."""
+    if notes_df.empty:
+        return {}
+
+    detail = notes_df[
+        (notes_df["SUBGRUPO_COD"] == sg_code)
+        & (notes_df["CUENTA"] == cuenta)
+    ].copy()
+    if detail.empty:
+        return {}
+
+    detail["TERCERO_LABEL"] = detail["TERCERO"].where(detail["TERCERO"] != "", "Sin tercero")
+    grouped = detail.groupby("TERCERO_LABEL", as_index=False, dropna=False)["VALOR"].sum()
+    return {
+        str(row["TERCERO_LABEL"]): _money(row["VALOR"])
+        for _, row in grouped.sort_values("TERCERO_LABEL").iterrows()
+    }
+
+
+def _notas_pct_variacion(valor: float, valor_anterior: float) -> float:
+    """Return variation percentage using the previous period as base."""
+    return (valor - valor_anterior) / abs(valor_anterior) if valor_anterior != 0 else 0
+
+
+def _notas_var_formula(row: int) -> str:
+    """Excel formula for value variation in the Notas sheet."""
+    return f"=C{row}-D{row}"
+
+
+def _notas_pct_formula(row: int) -> str:
+    """Excel formula for percentage variation in the Notas sheet."""
+    return f"=IF(D{row}=0,0,E{row}/ABS(D{row}))"
+
+
+def _notas_sum_formula(column: str, rows: list[int]) -> str:
+    """Excel formula that sums selected rows without including hidden detail twice."""
+    if not rows:
+        return "0"
+    return "=SUM(" + ",".join(f"{column}{row}" for row in rows) + ")"
+
+
+def _build_notas_sheet(
+    wb,
+    df_balance,
+    df_er,
+    branding,
+    periodo_actual,
+    periodo_anterior=None,
+    df_balance_anterior=None,
+    df_er_anterior=None,
+):
     ws = wb.create_sheet("Notas")
     ws.sheet_properties.outlinePr = Outline(summaryBelow=False)
 
     row = _write_header(ws, branding, "NOTAS A LOS ESTADOS FINANCIEROS",
                         f"(Expresados en pesos colombianos) — {periodo_actual}", merge_cols=6)
 
-    combined = pd.concat([df_balance, df_er], ignore_index=True)
-    if combined.empty:
+    current_notes = _prepare_notas_data(df_balance, df_er)
+    previous_notes = _prepare_notas_data(df_balance_anterior, df_er_anterior)
+
+    if current_notes.empty and previous_notes.empty:
         _wc(ws, row, 1, "Sin datos para generar notas.", font=FONT_BODY)
         return
 
-    combined["SUBGRUPO_COD"] = combined["CUENTA"].astype(str).str.extract(r'^(\d{2})')[0]
-
     nota_num = 1
-    subgrupo_codes = sorted(combined["SUBGRUPO_COD"].dropna().unique())
+    subgrupo_codes = sorted(set(current_notes["SUBGRUPO_COD"].dropna()) | set(previous_notes["SUBGRUPO_COD"].dropna()))
+    per_ant_label = periodo_anterior or "Período Anterior"
 
     for sg_code in subgrupo_codes:
-        sg_data = combined[combined["SUBGRUPO_COD"] == sg_code]
-        if sg_data.empty:
+        current_accounts = _notas_account_totals(current_notes, sg_code)
+        previous_accounts = _notas_account_totals(previous_notes, sg_code)
+        account_keys = sorted(
+            set(current_accounts) | set(previous_accounts),
+            key=lambda key: (
+                current_accounts.get(key, previous_accounts.get(key, {})).get("codigo", ""),
+                key,
+            ),
+        )
+
+        if not account_keys:
             continue
 
-        total_sub = sg_data["VALOR"].sum()
-        if total_sub == 0 and len(sg_data) < 2:
+        total_sub = sum(current_accounts.get(account, {}).get("valor", 0) for account in account_keys)
+        total_sub_ant = sum(previous_accounts.get(account, {}).get("valor", 0) for account in account_keys)
+        if total_sub == 0 and total_sub_ant == 0 and len(account_keys) < 2:
             continue
 
         niif_name = NIIF_NAMES.get(sg_code, ER_NIIF_NAMES.get(sg_code, sg_code))
 
         # Nota header
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
         _wc(ws, row, 1, f"NOTA {nota_num}    {niif_name}",
             font=FONT_SECTION, fill=FILL_TEAL_BG, border=THIN_BORDER)
-        for c in range(2, 5):
+        for c in range(2, 7):
             _sc(ws.cell(row=row, column=c), fill=FILL_TEAL_BG, border=THIN_BORDER)
         row += 1
 
         # Column headers
-        for i, h in enumerate(["CTA", "Cuenta", "Tercero", periodo_actual], 1):
+        for i, h in enumerate(["CTA", "Cuenta / Tercero", periodo_actual, per_ant_label, "Variación", "% Variación"], 1):
             _wc(ws, row, i, h, font=FONT_HEADER, fill=FILL_TEAL_LIGHT, border=THIN_BORDER, alignment=ALIGN_CENTER)
         row += 1
 
-        for _, acct_row in sg_data.iterrows():
-            val = _money(acct_row.get("VALOR", 0))
-            cuenta_str = str(acct_row.get("CUENTA", ""))
-            codigo = cuenta_str.split(" - ")[0].strip() if " - " in cuenta_str else ""
-            nombre = cuenta_str.split(" - ")[1].strip() if " - " in cuenta_str else cuenta_str
+        account_rows = []
+        for account in account_keys:
+            current_info = current_accounts.get(account)
+            previous_info = previous_accounts.get(account)
+            info = current_info or previous_info or {}
 
-            tercero = str(acct_row.get("TERCERO", "")) if pd.notna(acct_row.get("TERCERO")) else ""
+            codigo = info.get("codigo", "")
+            nombre = info.get("nombre", account)
+            account_row = row
+            account_rows.append(account_row)
 
-            _wc(ws, row, 1, codigo, font=FONT_BODY, border=THIN_BORDER)
-            _wc(ws, row, 2, nombre, font=FONT_BODY, border=THIN_BORDER, alignment=ALIGN_LEFT)
-            _wc(ws, row, 3, tercero, font=FONT_BODY, border=THIN_BORDER, alignment=ALIGN_LEFT)
-            _wc(ws, row, 4, val, font=FONT_BODY, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
-            ws.row_dimensions[row].outline_level = 1
-            ws.row_dimensions[row].hidden = True
+            _wc(ws, row, 1, codigo, font=FONT_BODY_BOLD, border=THIN_BORDER)
+            _wc(ws, row, 2, nombre, font=FONT_BODY_BOLD, border=THIN_BORDER, alignment=ALIGN_LEFT)
+            _wc(ws, row, 3, "", font=FONT_BODY_BOLD, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+            _wc(ws, row, 4, "", font=FONT_BODY_BOLD, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+            _wc(ws, row, 5, "", font=FONT_BODY_BOLD, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+            _wc(ws, row, 6, "", font=FONT_BODY_BOLD, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT)
             row += 1
+
+            current_terceros = _notas_tercero_totals(current_notes, sg_code, account)
+            previous_terceros = _notas_tercero_totals(previous_notes, sg_code, account)
+            tercero_keys = sorted(set(current_terceros) | set(previous_terceros))
+            detail_start_row = row
+
+            for tercero in tercero_keys:
+                tercero_val = current_terceros.get(tercero, 0)
+                tercero_val_ant = previous_terceros.get(tercero, 0)
+
+                _wc(ws, row, 1, "", font=FONT_DETAIL, border=THIN_BORDER)
+                _wc(ws, row, 2, f"    {tercero}", font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_LEFT)
+                _wc(ws, row, 3, tercero_val, font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+                _wc(ws, row, 4, tercero_val_ant, font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+                _wc(ws, row, 5, _notas_var_formula(row), font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+                _wc(ws, row, 6, _notas_pct_formula(row), font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT)
+                ws.row_dimensions[row].outline_level = 1
+                ws.row_dimensions[row].hidden = True
+                row += 1
+
+            detail_end_row = row - 1
+            if detail_start_row <= detail_end_row:
+                ws.cell(row=account_row, column=3).value = f"=SUM(C{detail_start_row}:C{detail_end_row})"
+                ws.cell(row=account_row, column=4).value = f"=SUM(D{detail_start_row}:D{detail_end_row})"
+            else:
+                ws.cell(row=account_row, column=3).value = current_info.get("valor", 0) if current_info else 0
+                ws.cell(row=account_row, column=4).value = previous_info.get("valor", 0) if previous_info else 0
+            ws.cell(row=account_row, column=5).value = _notas_var_formula(account_row)
+            ws.cell(row=account_row, column=6).value = _notas_pct_formula(account_row)
 
         _wc(ws, row, 1, "", fill=FILL_TEAL_LIGHT, border=THIN_BORDER)
         _wc(ws, row, 2, "Total", font=FONT_BODY_BOLD, fill=FILL_TEAL_LIGHT, border=THIN_BORDER)
-        _wc(ws, row, 3, "", fill=FILL_TEAL_LIGHT, border=THIN_BORDER)
-        _wc(ws, row, 4, total_sub, font=FONT_BODY_BOLD, fill=FILL_TEAL_LIGHT, border=THIN_BORDER,
+        _wc(ws, row, 3, _notas_sum_formula("C", account_rows),
+            font=FONT_BODY_BOLD, fill=FILL_TEAL_LIGHT, border=THIN_BORDER,
             alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+        _wc(ws, row, 4, _notas_sum_formula("D", account_rows),
+            font=FONT_BODY_BOLD, fill=FILL_TEAL_LIGHT, border=THIN_BORDER,
+            alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+        _wc(ws, row, 5, _notas_var_formula(row),
+            font=FONT_BODY_BOLD, fill=FILL_TEAL_LIGHT, border=THIN_BORDER,
+            alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+        _wc(ws, row, 6, _notas_pct_formula(row),
+            font=FONT_BODY_BOLD, fill=FILL_TEAL_LIGHT, border=THIN_BORDER,
+            alignment=ALIGN_RIGHT, number_format=PCT_FMT)
         row += 2
 
         nota_num += 1
 
     ws.column_dimensions["A"].width = 12
-    ws.column_dimensions["B"].width = 40
-    ws.column_dimensions["C"].width = 28
+    ws.column_dimensions["B"].width = 56
+    ws.column_dimensions["C"].width = 18
     ws.column_dimensions["D"].width = 18
+    ws.column_dimensions["E"].width = 18
+    ws.column_dimensions["F"].width = 12
 
 
 # ---------------------------------------------------------------------------
@@ -1087,6 +1399,15 @@ def _build_pie(ws, df, clase, title, data_row, anchor, col_off):
         return
 
     grouped["LABEL"] = grouped["SG"].map(lambda x: NIIF_NAMES.get(x, x))
+    source_ws = ws.parent["EF"] if "EF" in ws.parent.sheetnames else None
+
+    def _find_ef_row(label):
+        if source_ws is None:
+            return None
+        for source_row in range(1, source_ws.max_row + 1):
+            if source_ws.cell(source_row, 2).value == label:
+                return source_row
+        return None
 
     cl, cv = 1 + col_off, 2 + col_off
     _wc(ws, data_row, cl, "Concepto", font=FONT_HEADER, fill=FILL_TEAL_LIGHT, border=THIN_BORDER)
@@ -1094,8 +1415,11 @@ def _build_pie(ws, df, clase, title, data_row, anchor, col_off):
 
     for i, (_, r) in enumerate(grouped.iterrows()):
         rr = data_row + 1 + i
-        _wc(ws, rr, cl, r["LABEL"], font=FONT_BODY, border=THIN_BORDER)
-        _wc(ws, rr, cv, abs(r["VALOR"]), font=FONT_BODY, border=THIN_BORDER, number_format=NUM_FMT)
+        label = r["LABEL"]
+        source_row = _find_ef_row(label)
+        value = f"=ABS('EF'!D{source_row})" if source_row else abs(r["VALOR"])
+        _wc(ws, rr, cl, label, font=FONT_BODY, border=THIN_BORDER)
+        _wc(ws, rr, cv, value, font=FONT_BODY, border=THIN_BORDER, number_format=NUM_FMT)
 
     last = data_row + len(grouped)
     pie = PieChart()
@@ -1127,14 +1451,33 @@ def _build_bar(ws, df_er, data_row, anchor):
     if not items:
         return
 
+    source_ws = ws.parent["ER"] if "ER" in ws.parent.sheetnames else None
+    source_labels = {
+        "Ingresos": "Venta de producto y prestación de servicios",
+        "Gastos Admin": "Total Gastos de administración",
+        "Gastos Venta": "Total Gastos de Venta",
+        "Costo Ventas": "MENOS:  COSTO DE VENTAS",
+        "Gastos No Op": "Gastos no ordinarios",
+    }
+
+    def _find_er_row(label):
+        if source_ws is None:
+            return None
+        for source_row in range(1, source_ws.max_row + 1):
+            if source_ws.cell(source_row, 2).value == label:
+                return source_row
+        return None
+
     col = 10
     _wc(ws, data_row, col, "Concepto", font=FONT_HEADER, fill=FILL_TEAL_LIGHT, border=THIN_BORDER)
     _wc(ws, data_row, col + 1, "Valor", font=FONT_HEADER, fill=FILL_TEAL_LIGHT, border=THIN_BORDER)
 
     for i, (label, val) in enumerate(items.items()):
         rr = data_row + 1 + i
+        source_row = _find_er_row(source_labels.get(label, ""))
+        value = f"=ABS('ER'!D{source_row})" if source_row else val
         _wc(ws, rr, col, label, font=FONT_BODY, border=THIN_BORDER)
-        _wc(ws, rr, col + 1, val, font=FONT_BODY, border=THIN_BORDER, number_format=NUM_FMT)
+        _wc(ws, rr, col + 1, value, font=FONT_BODY, border=THIN_BORDER, number_format=NUM_FMT)
 
     last = data_row + len(items)
     bar = BarChart()
@@ -1168,12 +1511,24 @@ def generate_informe(
     """
     wb = Workbook()
     wb.remove(wb.active)
+    wb.calculation.calcMode = "auto"
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
 
     nota_next = _build_ef_sheet(wb, df_balance, branding, periodo_actual,
                                  periodo_anterior, df_balance_anterior)
     _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=nota_next,
                     periodo_anterior=periodo_anterior, df_er_anterior=df_er_anterior)
-    _build_notas_sheet(wb, df_balance, df_er, branding, periodo_actual)
+    _build_notas_sheet(
+        wb,
+        df_balance,
+        df_er,
+        branding,
+        periodo_actual,
+        periodo_anterior=periodo_anterior,
+        df_balance_anterior=df_balance_anterior,
+        df_er_anterior=df_er_anterior,
+    )
     _build_graficas_sheet(wb, df_balance, df_er, branding)
 
     output = BytesIO()
