@@ -223,12 +223,16 @@ def make_branding(
     contador: str = "",
     contador_tp: str = "",
     contador_cc: str = "",
+    revisor_fiscal: str = "",
+    revisor_tp: str = "",
+    revisor_cc: str = "",
     logo_bytes: bytes | None = None,
 ) -> dict[str, Any]:
     return dict(
         empresa=empresa, nit=nit,
         representante_legal=representante_legal, representante_cc=representante_cc,
         contador=contador, contador_tp=contador_tp, contador_cc=contador_cc,
+        revisor_fiscal=revisor_fiscal, revisor_tp=revisor_tp, revisor_cc=revisor_cc,
         logo_bytes=logo_bytes,
     )
 
@@ -585,6 +589,24 @@ def _write_header(ws, branding, title, subtitle, start_row=1, merge_cols=8):
 # ---------------------------------------------------------------------------
 # Signature block
 # ---------------------------------------------------------------------------
+def _write_signature_line(ws, row, start_col, end_col, value, font):
+    ws.merge_cells(start_row=row, start_column=start_col, end_row=row, end_column=end_col)
+    _wc(ws, row, start_col, value, font=font, alignment=ALIGN_CENTER)
+
+
+def _write_signature_block(ws, row, start_col, end_col, name, role, extra_lines):
+    _write_signature_line(ws, row, start_col, end_col, name, FONT_FIRMA_BOLD)
+    row += 1
+    _write_signature_line(ws, row, start_col, end_col, role, FONT_FIRMA)
+    row += 1
+
+    for line in extra_lines:
+        if not line:
+            continue
+        _write_signature_line(ws, row, start_col, end_col, line, FONT_FIRMA)
+        row += 1
+
+
 def _write_signatures(ws, branding, start_row, col_left=1, col_right=6):
     row = start_row + 2
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
@@ -592,25 +614,50 @@ def _write_signatures(ws, branding, start_row, col_left=1, col_right=6):
         font=Font(name="Arial Narrow", size=8, italic=True, color=COL_GRAY), alignment=ALIGN_CENTER)
     row += 3
 
-    # Rep Legal
-    _wc(ws, row, col_left, branding.get("representante_legal", ""), font=FONT_FIRMA_BOLD)
-    row += 1
-    _wc(ws, row, col_left, "Representante Legal", font=FONT_FIRMA)
-    row += 1
-    if branding.get("representante_cc"):
-        _wc(ws, row, col_left, f"C.C. {branding['representante_cc']}", font=FONT_FIRMA)
+    has_revisor = any(
+        branding.get(key) for key in ("revisor_fiscal", "revisor_tp", "revisor_cc")
+    )
+    signature_columns = [(1, 3), (6, 8)]
+    if has_revisor:
+        signature_columns = [(1, 3), (4, 6), (7, 8)]
 
-    # Contador
-    cr = start_row + 5
-    _wc(ws, cr, col_right, branding.get("contador", ""), font=FONT_FIRMA_BOLD)
-    cr += 1
-    _wc(ws, cr, col_right, "Contadora Pública" if branding.get("contador") else "", font=FONT_FIRMA)
-    cr += 1
-    if branding.get("contador_tp"):
-        _wc(ws, cr, col_right, f"T.P. {branding['contador_tp']}", font=FONT_FIRMA)
-        cr += 1
-    if branding.get("contador_cc"):
-        _wc(ws, cr, col_right, f"C.C {branding['contador_cc']}", font=FONT_FIRMA)
+    rep_cols, contador_cols = signature_columns[:2]
+    _write_signature_block(
+        ws,
+        row,
+        rep_cols[0],
+        rep_cols[1],
+        branding.get("representante_legal", ""),
+        "Representante Legal",
+        [f"C.C. {branding['representante_cc']}" if branding.get("representante_cc") else ""],
+    )
+    _write_signature_block(
+        ws,
+        row,
+        contador_cols[0],
+        contador_cols[1],
+        branding.get("contador", ""),
+        "Contadora Pública" if branding.get("contador") else "",
+        [
+            f"T.P. {branding['contador_tp']}" if branding.get("contador_tp") else "",
+            f"C.C {branding['contador_cc']}" if branding.get("contador_cc") else "",
+        ],
+    )
+
+    if has_revisor:
+        revisor_cols = signature_columns[2]
+        _write_signature_block(
+            ws,
+            row,
+            revisor_cols[0],
+            revisor_cols[1],
+            branding.get("revisor_fiscal", ""),
+            "Revisor Fiscal",
+            [
+                f"T.P. {branding['revisor_tp']}" if branding.get("revisor_tp") else "",
+                f"C.C {branding['revisor_cc']}" if branding.get("revisor_cc") else "",
+            ],
+        )
 
 
 # ---------------------------------------------------------------------------

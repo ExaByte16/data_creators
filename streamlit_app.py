@@ -695,6 +695,15 @@ def main() -> None:
             branding_contador_cc = st.text_input("C.C. Contador(a)", value="")
             branding_logo = st.file_uploader("Logo (PNG/JPG)", type=["png", "jpg", "jpeg"])
 
+        st.markdown("**Revisor Fiscal (opcional)**")
+        col_rf1, col_rf2, col_rf3 = st.columns(3)
+        with col_rf1:
+            branding_revisor = st.text_input("Revisor Fiscal", value="")
+        with col_rf2:
+            branding_revisor_tp = st.text_input("T.P. Revisor Fiscal", value="")
+        with col_rf3:
+            branding_revisor_cc = st.text_input("C.C. Revisor Fiscal", value="")
+
         logo_bytes = branding_logo.read() if branding_logo else None
         branding_config = make_branding(
             empresa=branding_empresa,
@@ -704,6 +713,9 @@ def main() -> None:
             contador=branding_contador,
             contador_tp=branding_contador_tp,
             contador_cc=branding_contador_cc,
+            revisor_fiscal=branding_revisor,
+            revisor_tp=branding_revisor_tp,
+            revisor_cc=branding_revisor_cc,
             logo_bytes=logo_bytes,
         )
 
