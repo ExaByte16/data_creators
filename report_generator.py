@@ -551,6 +551,103 @@ def _write_er_4dig_detail_rows(ws, row, df_er, df_er_ant, code4,
     return row, account_rows, calc_rows
 
 
+def _er_4dig_codes(df_er: pd.DataFrame | None, sg_code: str) -> set[str]:
+    """Return 4-digit account groups present under one ER 2-digit section."""
+    if df_er is None or df_er.empty:
+        return set()
+    df = df_er.copy()
+    df["_code"] = df["CUENTA"].astype(str).str.extract(r'^(\d+)')[0].fillna("")
+    return set(df.loc[df["_code"].str[:2] == sg_code, "_code"].str[:4])
+
+
+def _er_4dig_label(df_er: pd.DataFrame | None, code4: str) -> str:
+    """Best available display name for a 4-digit ER group."""
+    if code4 in GASTOS_4DIG_NAMES:
+        return GASTOS_4DIG_NAMES[code4]
+    if df_er is None or df_er.empty:
+        return f"Detalle cuenta {code4}"
+
+    df = df_er.copy()
+    df["_code"] = df["CUENTA"].astype(str).str.extract(r'^(\d+)')[0].fillna("")
+    group = df[df["_code"].str[:4] == code4]
+    if group.empty:
+        return f"Detalle cuenta {code4}"
+
+    if code4.startswith(("4", "5")) and "SUBGRUPO" in group.columns:
+        labels = group["SUBGRUPO"].dropna().astype(str).str.strip()
+        labels = labels[labels != ""]
+        if not labels.empty:
+            return labels.iloc[0]
+
+    cuenta_parts = group["CUENTA"].astype(str).str.split(" - ", n=1, expand=True)
+    if cuenta_parts.shape[1] > 1:
+        names = cuenta_parts[1].dropna().astype(str).str.strip()
+        names = names[names != ""]
+        if not names.empty:
+            return names.iloc[0]
+
+    return f"Detalle cuenta {code4}"
+
+
+def _write_er_4dig_group_rows(
+    ws,
+    row,
+    df_er,
+    df_er_ant,
+    sg_code,
+    total_ingresos,
+    total_ingresos_ant,
+    base_level=1,
+):
+    """Write 4-digit summary rows, then account and tercero rows under each group."""
+    code4_list = sorted(_er_4dig_codes(df_er, sg_code) | _er_4dig_codes(df_er_ant, sg_code))
+    group_rows = []
+    calc_rows = []
+
+    for code4 in code4_list:
+        label = _er_4dig_label(df_er, code4)
+        if label.startswith("Detalle cuenta") and df_er_ant is not None:
+            label = _er_4dig_label(df_er_ant, code4)
+
+        group_row = row
+        group_rows.append(group_row)
+        calc_rows.append(group_row)
+
+        indent = "  " * base_level
+        c = 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER); c += 1
+        _wc(ws, row, c, f"{indent}{code4} - {label}", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_LEFT); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_CENTER); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG); c += 1
+        _wc(ws, row, c, "", font=FONT_BODY, fill=FILL_WHITE, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT); c += 1
+        _wc(ws, row, c, "TRUE", font=FONT_FILTRO)
+        ws.row_dimensions[row].outline_level = base_level
+        ws.row_dimensions[row].hidden = True
+        row += 1
+
+        row, account_rows, detail_calc_rows = _write_er_4dig_detail_rows(
+            ws,
+            row,
+            df_er,
+            df_er_ant,
+            code4,
+            total_ingresos,
+            total_ingresos_ant,
+            base_level=base_level + 1,
+        )
+        if account_rows:
+            ws.cell(row=group_row, column=4).value = _sum_selected_rows("D", account_rows)
+            ws.cell(row=group_row, column=6).value = _sum_selected_rows("F", account_rows)
+        _apply_variation_formulas(ws, group_row)
+        calc_rows.extend(detail_calc_rows)
+
+    return row, group_rows, calc_rows
+
+
 # ---------------------------------------------------------------------------
 # Header block
 # ---------------------------------------------------------------------------
@@ -973,8 +1070,8 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
 
     # Ventas (41)
     ingresos_row = _row_item("Venta de producto y prestación de servicios", ingresos_41, ingresos_41_ant, note=True)
-    # Detail for 41 (level 1 = cuenta, level 2 = tercero)
-    row, ingresos_account_rows, ingresos_calc_rows = _write_er_detail_rows(
+    # Detail for 41: categoría 4 dígitos -> cuenta -> tercero
+    row, ingresos_account_rows, ingresos_calc_rows = _write_er_4dig_group_rows(
         ws, row, df_er, df_er_anterior, "41",
         total_ingresos, total_ingresos_ant, base_level=1
     )
@@ -989,10 +1086,10 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
     costos = sum(_get_val(c) for c in costo_codes)
     costos_ant = sum(_get_val_ant(c) for c in costo_codes)
     costos_row = _row_item("MENOS:  COSTO DE VENTAS", costos, costos_ant)
-    # Detail for each costo code
+    # Detail for each costo code: 4 dígitos -> cuenta -> tercero
     costo_account_rows = []
     for costo_sg in costo_codes:
-        row, account_rows, detail_calc_rows = _write_er_detail_rows(
+        row, account_rows, detail_calc_rows = _write_er_4dig_group_rows(
             ws, row, df_er, df_er_anterior, costo_sg,
             total_ingresos, total_ingresos_ant, base_level=1
         )
@@ -1105,7 +1202,7 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
     ing_no_ord = _get_val("42")
     ing_no_ord_ant = _get_val_ant("42")
     ing_no_ord_row = _row_item("Ingresos no ordinarios", ing_no_ord, ing_no_ord_ant, note=True)
-    row, account_rows, detail_calc_rows = _write_er_detail_rows(
+    row, account_rows, detail_calc_rows = _write_er_4dig_group_rows(
         ws, row, df_er, df_er_anterior, "42",
         total_ingresos, total_ingresos_ant, base_level=1
     )
@@ -1119,7 +1216,7 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
     gtos_no_ord = _get_val("53")
     gtos_no_ord_ant = _get_val_ant("53")
     gtos_no_ord_row = _row_item("Gastos no ordinarios", gtos_no_ord, gtos_no_ord_ant, note=True)
-    row, account_rows, detail_calc_rows = _write_er_detail_rows(
+    row, account_rows, detail_calc_rows = _write_er_4dig_group_rows(
         ws, row, df_er, df_er_anterior, "53",
         total_ingresos, total_ingresos_ant, base_level=1
     )
@@ -1141,7 +1238,7 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
     imp_renta = _get_val("54")
     imp_renta_ant = _get_val_ant("54")
     imp_renta_row = _row_item("Provisión Impuesto de Renta", imp_renta, imp_renta_ant)
-    row, account_rows, detail_calc_rows = _write_er_detail_rows(
+    row, account_rows, detail_calc_rows = _write_er_4dig_group_rows(
         ws, row, df_er, df_er_anterior, "54",
         total_ingresos, total_ingresos_ant, base_level=1
     )
@@ -1181,7 +1278,16 @@ def _build_er_sheet(wb, df_er, branding, periodo_actual, nota_start=1,
 def _prepare_notas_data(*dfs: pd.DataFrame | None) -> pd.DataFrame:
     """Normalize report data for Notas: subgrupo, cuenta, tercero and valor."""
     frames = [df for df in dfs if df is not None and not df.empty]
-    columns = ["SUBGRUPO_COD", "CUENTA", "CUENTA_COD", "CUENTA_NOMBRE", "TERCERO", "VALOR"]
+    columns = [
+        "SUBGRUPO_COD",
+        "CUENTA4_COD",
+        "CUENTA4_NOMBRE",
+        "CUENTA",
+        "CUENTA_COD",
+        "CUENTA_NOMBRE",
+        "TERCERO",
+        "VALOR",
+    ]
     if not frames:
         return pd.DataFrame(columns=columns)
 
@@ -1197,6 +1303,7 @@ def _prepare_notas_data(*dfs: pd.DataFrame | None) -> pd.DataFrame:
     combined["VALOR"] = pd.to_numeric(combined["VALOR"], errors="coerce").fillna(0)
     combined["CUENTA_COD"] = combined["CUENTA"].str.extract(r'^(\d+)')[0].fillna("")
     combined["SUBGRUPO_COD"] = combined["CUENTA_COD"].str[:2]
+    combined["CUENTA4_COD"] = combined["CUENTA_COD"].str[:4]
 
     cuenta_parts = combined["CUENTA"].str.split(" - ", n=1, expand=True)
     if cuenta_parts.shape[1] > 1:
@@ -1204,6 +1311,34 @@ def _prepare_notas_data(*dfs: pd.DataFrame | None) -> pd.DataFrame:
     else:
         combined["CUENTA_NOMBRE"] = combined["CUENTA"]
     combined["CUENTA_NOMBRE"] = combined["CUENTA_NOMBRE"].astype(str).str.strip()
+
+    if "SUBGRUPO" in combined.columns:
+        combined["_SUBGRUPO_LABEL"] = combined["SUBGRUPO"].fillna("").astype(str).str.strip()
+    else:
+        combined["_SUBGRUPO_LABEL"] = ""
+
+    def _cuenta4_nombre(code4: str, group: pd.DataFrame) -> str:
+        exact_parent = group[group["CUENTA_COD"] == code4]
+        if not exact_parent.empty:
+            return str(exact_parent.iloc[0]["CUENTA_NOMBRE"]).strip()
+
+        first_code = str(group.iloc[0]["CUENTA_COD"])
+        if first_code[:4] in GASTOS_4DIG_NAMES:
+            return GASTOS_4DIG_NAMES[first_code[:4]]
+
+        if first_code.startswith(("4", "5")):
+            labels = group["_SUBGRUPO_LABEL"]
+            labels = labels[labels != ""]
+            if not labels.empty:
+                return str(labels.iloc[0]).strip()
+
+        return f"Detalle cuenta {code4}"
+
+    cuenta4_names = {
+        code4: _cuenta4_nombre(code4, group)
+        for code4, group in combined.groupby("CUENTA4_COD", dropna=False)
+    }
+    combined["CUENTA4_NOMBRE"] = combined["CUENTA4_COD"].map(cuenta4_names).fillna("")
 
     if "TERCERO" not in combined.columns:
         combined["TERCERO"] = ""
@@ -1340,60 +1475,106 @@ def _build_notas_sheet(
             _wc(ws, row, i, h, font=FONT_HEADER, fill=FILL_TEAL_LIGHT, border=THIN_BORDER, alignment=ALIGN_CENTER)
         row += 1
 
-        account_rows = []
-        for account in account_keys:
-            current_info = current_accounts.get(account)
-            previous_info = previous_accounts.get(account)
-            info = current_info or previous_info or {}
+        group4_keys = sorted({(current_accounts.get(account) or previous_accounts.get(account) or {}).get("codigo", "")[:4] for account in account_keys})
+        group_rows = []
 
-            codigo = info.get("codigo", "")
-            nombre = info.get("nombre", account)
-            account_row = row
-            account_rows.append(account_row)
+        for group4 in group4_keys:
+            group_accounts = [
+                account
+                for account in account_keys
+                if (current_accounts.get(account) or previous_accounts.get(account) or {}).get("codigo", "").startswith(group4)
+            ]
+            if not group_accounts:
+                continue
 
-            _wc(ws, row, 1, codigo, font=FONT_BODY_BOLD, border=THIN_BORDER)
-            _wc(ws, row, 2, nombre, font=FONT_BODY_BOLD, border=THIN_BORDER, alignment=ALIGN_LEFT)
+            group_notes = pd.concat(
+                [
+                    notes
+                    for notes in [
+                        current_notes[(current_notes["SUBGRUPO_COD"] == sg_code) & (current_notes["CUENTA4_COD"] == group4)],
+                        previous_notes[(previous_notes["SUBGRUPO_COD"] == sg_code) & (previous_notes["CUENTA4_COD"] == group4)],
+                    ]
+                    if not notes.empty
+                ],
+                ignore_index=True,
+            )
+            group_name = (
+                str(group_notes["CUENTA4_NOMBRE"].dropna().iloc[0]).strip()
+                if not group_notes.empty and not group_notes["CUENTA4_NOMBRE"].dropna().empty
+                else f"Detalle cuenta {group4}"
+            )
+
+            group_row = row
+            group_rows.append(group_row)
+            _wc(ws, row, 1, group4, font=FONT_BODY_BOLD, border=THIN_BORDER)
+            _wc(ws, row, 2, group_name, font=FONT_BODY_BOLD, border=THIN_BORDER, alignment=ALIGN_LEFT)
             _wc(ws, row, 3, "", font=FONT_BODY_BOLD, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
             _wc(ws, row, 4, "", font=FONT_BODY_BOLD, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
             _wc(ws, row, 5, "", font=FONT_BODY_BOLD, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
             _wc(ws, row, 6, "", font=FONT_BODY_BOLD, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT)
             row += 1
 
-            current_terceros = _notas_tercero_totals(current_notes, sg_code, account)
-            previous_terceros = _notas_tercero_totals(previous_notes, sg_code, account)
-            tercero_keys = sorted(set(current_terceros) | set(previous_terceros))
-            detail_start_row = row
+            account_rows = []
+            for account in group_accounts:
+                current_info = current_accounts.get(account)
+                previous_info = previous_accounts.get(account)
+                info = current_info or previous_info or {}
 
-            for tercero in tercero_keys:
-                tercero_val = current_terceros.get(tercero, 0)
-                tercero_val_ant = previous_terceros.get(tercero, 0)
+                codigo = info.get("codigo", "")
+                nombre = info.get("nombre", account)
+                account_row = row
+                account_rows.append(account_row)
 
-                _wc(ws, row, 1, "", font=FONT_DETAIL, border=THIN_BORDER)
-                _wc(ws, row, 2, f"    {tercero}", font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_LEFT)
-                _wc(ws, row, 3, tercero_val, font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
-                _wc(ws, row, 4, tercero_val_ant, font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
-                _wc(ws, row, 5, _notas_var_formula(row), font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
-                _wc(ws, row, 6, _notas_pct_formula(row), font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT)
+                _wc(ws, row, 1, codigo, font=FONT_BODY, border=THIN_BORDER)
+                _wc(ws, row, 2, f"    {nombre}", font=FONT_BODY, border=THIN_BORDER, alignment=ALIGN_LEFT)
+                _wc(ws, row, 3, "", font=FONT_BODY, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+                _wc(ws, row, 4, "", font=FONT_BODY, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+                _wc(ws, row, 5, "", font=FONT_BODY, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+                _wc(ws, row, 6, "", font=FONT_BODY, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT)
                 ws.row_dimensions[row].outline_level = 1
                 ws.row_dimensions[row].hidden = True
                 row += 1
 
-            detail_end_row = row - 1
-            if detail_start_row <= detail_end_row:
-                ws.cell(row=account_row, column=3).value = f"=SUM(C{detail_start_row}:C{detail_end_row})"
-                ws.cell(row=account_row, column=4).value = f"=SUM(D{detail_start_row}:D{detail_end_row})"
-            else:
-                ws.cell(row=account_row, column=3).value = current_info.get("valor", 0) if current_info else 0
-                ws.cell(row=account_row, column=4).value = previous_info.get("valor", 0) if previous_info else 0
-            ws.cell(row=account_row, column=5).value = _notas_var_formula(account_row)
-            ws.cell(row=account_row, column=6).value = _notas_pct_formula(account_row)
+                current_terceros = _notas_tercero_totals(current_notes, sg_code, account)
+                previous_terceros = _notas_tercero_totals(previous_notes, sg_code, account)
+                tercero_keys = sorted(set(current_terceros) | set(previous_terceros))
+                detail_start_row = row
+
+                for tercero in tercero_keys:
+                    tercero_val = current_terceros.get(tercero, 0)
+                    tercero_val_ant = previous_terceros.get(tercero, 0)
+
+                    _wc(ws, row, 1, "", font=FONT_DETAIL, border=THIN_BORDER)
+                    _wc(ws, row, 2, f"        {tercero}", font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_LEFT)
+                    _wc(ws, row, 3, tercero_val, font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+                    _wc(ws, row, 4, tercero_val_ant, font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+                    _wc(ws, row, 5, _notas_var_formula(row), font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
+                    _wc(ws, row, 6, _notas_pct_formula(row), font=FONT_DETAIL, border=THIN_BORDER, alignment=ALIGN_RIGHT, number_format=PCT_FMT)
+                    ws.row_dimensions[row].outline_level = 2
+                    ws.row_dimensions[row].hidden = True
+                    row += 1
+
+                detail_end_row = row - 1
+                if detail_start_row <= detail_end_row:
+                    ws.cell(row=account_row, column=3).value = f"=SUM(C{detail_start_row}:C{detail_end_row})"
+                    ws.cell(row=account_row, column=4).value = f"=SUM(D{detail_start_row}:D{detail_end_row})"
+                else:
+                    ws.cell(row=account_row, column=3).value = current_info.get("valor", 0) if current_info else 0
+                    ws.cell(row=account_row, column=4).value = previous_info.get("valor", 0) if previous_info else 0
+                ws.cell(row=account_row, column=5).value = _notas_var_formula(account_row)
+                ws.cell(row=account_row, column=6).value = _notas_pct_formula(account_row)
+
+            ws.cell(row=group_row, column=3).value = _notas_sum_formula("C", account_rows)
+            ws.cell(row=group_row, column=4).value = _notas_sum_formula("D", account_rows)
+            ws.cell(row=group_row, column=5).value = _notas_var_formula(group_row)
+            ws.cell(row=group_row, column=6).value = _notas_pct_formula(group_row)
 
         _wc(ws, row, 1, "", fill=FILL_TEAL_LIGHT, border=THIN_BORDER)
         _wc(ws, row, 2, "Total", font=FONT_BODY_BOLD, fill=FILL_TEAL_LIGHT, border=THIN_BORDER)
-        _wc(ws, row, 3, _notas_sum_formula("C", account_rows),
+        _wc(ws, row, 3, _notas_sum_formula("C", group_rows),
             font=FONT_BODY_BOLD, fill=FILL_TEAL_LIGHT, border=THIN_BORDER,
             alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
-        _wc(ws, row, 4, _notas_sum_formula("D", account_rows),
+        _wc(ws, row, 4, _notas_sum_formula("D", group_rows),
             font=FONT_BODY_BOLD, fill=FILL_TEAL_LIGHT, border=THIN_BORDER,
             alignment=ALIGN_RIGHT, number_format=NUM_FMT_NEG)
         _wc(ws, row, 5, _notas_var_formula(row),

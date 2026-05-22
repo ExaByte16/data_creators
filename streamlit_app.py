@@ -23,7 +23,7 @@ from typing import Tuple
 import pandas as pd
 import streamlit as st
 
-from report_generator import generate_informe, make_branding
+from report_generator import GASTOS_4DIG_NAMES, generate_informe, make_branding
 
 
 APP_TITLE = "Oxynia Balance General"
@@ -114,6 +114,137 @@ def determinar_grupo(row: pd.Series) -> str:
     elif clase_cod in ["8", "9"]:
         return "CUENTA DE ORDEN"
     return "NO CLASIFICADO"  # Para códigos que no encajen
+
+
+def _build_account_lookups(df: pd.DataFrame) -> Tuple[dict[str, str], dict[str, str]]:
+    """Mapas código → nombre desde todo el export (incluye filas no transaccionales)."""
+    lookup4: dict[str, str] = {}
+    lookup6: dict[str, str] = {}
+    for cod_raw, name_raw in zip(df["Código cuenta contable"], df["Nombre cuenta contable"]):
+        if pd.isna(cod_raw):
+            continue
+        try:
+            cod = str(int(float(cod_raw)))
+        except (ValueError, TypeError):
+            cod = str(cod_raw).strip().replace(".0", "")
+        name = str(name_raw).strip() if pd.notna(name_raw) else ""
+        if not cod or not name:
+            continue
+        if len(cod) == 4:
+            lookup4.setdefault(cod, name)
+        elif len(cod) == 6:
+            lookup6.setdefault(cod, name)
+    return lookup4, lookup6
+
+
+def _normalize_label(value: str) -> str:
+    import unicodedata
+
+    text = str(value).upper().strip()
+    return "".join(
+        c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn"
+    )
+
+
+# Alias de categorías para alinear con BASE DE DATOS E.R. del informe legacy
+ER_CATEGORIA_ALIASES = {
+    "DEPRECIACIONES": "DEPRECIACIÓN",
+    "GASTOS LEGALES": "LEGALES",
+    "MANTENIMIENTO Y REPARACIONES": "MANTENIMIENTO Y REPARACION",
+    "GASTOS EXTRAORDINARIOS": "EXTRAORDINARIOS",
+    "GASTOS DIVERSOS": "DIVERSOS",
+    "DEVOLUCIÓN EN VENTAS": "DEVOLUCION EN VENTA",
+    "DESCUENTOS EN SERVICIOS": "DESCUENTO EN SERVICIOS",
+}
+
+
+def _categoria_er(
+    cod_str: str,
+    lookup4: dict[str, str],
+    lookup6: dict[str, str],
+    nombre: str = "",
+) -> str:
+    """Categoría P&L (col G): nombre de la cuenta de 4 dígitos en el PUC."""
+    cod4 = cod_str[:4]
+    if cod_str.startswith("4") and nombre.strip():
+        parent4 = lookup4.get(cod4, "")
+        parent6 = lookup6.get(cod_str[:6], parent4) if len(cod_str) >= 6 else parent4
+        nombre_clean = nombre.strip()
+        if (
+            _normalize_label(nombre_clean) != _normalize_label(parent4)
+            and _normalize_label(nombre_clean) != _normalize_label(parent6)
+        ):
+            return ER_CATEGORIA_ALIASES.get(nombre_clean.upper(), nombre_clean.upper())
+
+    if cod4 in GASTOS_4DIG_NAMES:
+        categoria = GASTOS_4DIG_NAMES[cod4].upper()
+    elif cod4 in lookup4:
+        categoria = lookup4[cod4].upper()
+    else:
+        categoria = SUBGRUPO_MAP.get(cod_str[:2], "NO DEFINIDO")
+
+    return ER_CATEGORIA_ALIASES.get(categoria, categoria)
+
+
+def _grupo_costos_er(cod_str: str, lookup4: dict[str, str], lookup6: dict[str, str]) -> str:
+    """Grupo P&L para costos (col F): subcuenta de 6 dígitos o cuenta de 4."""
+    cod6 = cod_str[:6] if len(cod_str) >= 6 else cod_str
+    if cod6 in lookup6:
+        return lookup6[cod6].upper()
+    cod4 = cod_str[:4]
+    if cod4 in lookup4:
+        return lookup4[cod4].upper()
+    return "NO CLASIFICADO"
+
+
+def _asignar_grupo_subgrupo(
+    df: pd.DataFrame, lookup4: dict[str, str], lookup6: dict[str, str]
+) -> pd.DataFrame:
+    """
+    Balance (1-3): GRUPO = corriente/no corriente, SUBGRUPO = PUC 2 dígitos.
+    ER ingresos/gastos (4-5): GRUPO = PUC 2 dígitos, SUBGRUPO (col G) = categoría 4 dígitos.
+    ER costos (6-7): GRUPO = subcuenta 6 dígitos, SUBGRUPO (col G) = PUC 2 dígitos.
+    """
+    df = df.copy()
+    first_digit = df["Código str"].str[0]
+
+    bg_mask = first_digit.isin(["1", "2", "3", "8", "9"])
+    ingresos_mask = first_digit == "4"
+    gastos_mask = first_digit == "5"
+    costo_mask = first_digit.isin(["6", "7"])
+
+    df.loc[bg_mask, "SUBGRUPO"] = (
+        df.loc[bg_mask, "Código str"].str[:2].map(SUBGRUPO_MAP).fillna("NO DEFINIDO")
+    )
+    df.loc[bg_mask, "GRUPO"] = df.loc[bg_mask].apply(determinar_grupo, axis=1)
+
+    df.loc[ingresos_mask | gastos_mask, "GRUPO"] = (
+        df.loc[ingresos_mask | gastos_mask, "Código str"]
+        .str[:2]
+        .map(SUBGRUPO_MAP)
+        .fillna("NO CLASIFICADO")
+    )
+    df.loc[ingresos_mask, "SUBGRUPO"] = df.loc[ingresos_mask].apply(
+        lambda row: _categoria_er(
+            row["Código str"],
+            lookup4,
+            lookup6,
+            str(row.get("Nombre cuenta contable", "")),
+        ),
+        axis=1,
+    )
+    df.loc[gastos_mask, "SUBGRUPO"] = df.loc[gastos_mask]["Código str"].apply(
+        lambda cod: _categoria_er(cod, lookup4, lookup6)
+    )
+
+    df.loc[costo_mask, "SUBGRUPO"] = (
+        df.loc[costo_mask, "Código str"].str[:2].map(SUBGRUPO_MAP).fillna("NO DEFINIDO")
+    )
+    df.loc[costo_mask, "GRUPO"] = df.loc[costo_mask, "Código str"].apply(
+        lambda cod: _grupo_costos_er(cod, lookup4, lookup6)
+    )
+
+    return df
 
 
 def _filter_leaf_accounts(df: pd.DataFrame) -> pd.DataFrame:
@@ -473,7 +604,9 @@ def process_dataframe(
         "Sucursal",
         "Identificación",
     ]
-    df_filtered = df_filtered.drop(columns=columns_to_drop)
+    df_filtered = df_filtered.drop(columns=columns_to_drop, errors="ignore")
+
+    lookup4, lookup6 = _build_account_lookups(df)
 
     # Agregar por cuenta (y opcionalmente por tercero) para conservar o resumir el detalle de terceros
     if desglosar_por_tercero:
@@ -524,10 +657,7 @@ def process_dataframe(
     df_unique_accounts["CLASE"] = (
         df_unique_accounts["Código str"].str[0].map(CLASE_MAP).fillna("NO DEFINIDA")
     )
-    df_unique_accounts["SUBGRUPO"] = (
-        df_unique_accounts["Código str"].str[:2].map(SUBGRUPO_MAP).fillna("NO DEFINIDO")
-    )
-    df_unique_accounts["GRUPO"] = df_unique_accounts.apply(determinar_grupo, axis=1)
+    df_unique_accounts = _asignar_grupo_subgrupo(df_unique_accounts, lookup4, lookup6)
 
     # Crear las columnas 'Cuenta' y 'Valor' y 'TERCERO'
     df_unique_accounts["CUENTA"] = (
